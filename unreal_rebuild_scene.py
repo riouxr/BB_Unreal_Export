@@ -192,17 +192,33 @@ def group_actors_into_level_instance(actors):
     # If any step fails, this falls back to just selecting the actors so the
     # one remaining manual step (right-click > Level > Create Level Instance)
     # is a single click instead of hunting for the actors first.
+    #
+    # IMPORTANT: move_actors_to_level destroys and recreates each actor in
+    # the destination level rather than reparenting it -- the original
+    # Python actor handles become invalid ("ObjectInstance is null") for
+    # actors that succeeded too, not just ones that failed. So labels are
+    # captured up front, and everything after the move re-resolves actors
+    # fresh by label instead of touching the original `actors` list again.
+    labels = [a.get_actor_label() for a in actors]
+    persistent_level = actors[0].get_level() if actors else None
+
     try:
-        _create_level_instance_from_actors(actors)
+        _create_level_instance_from_actors(actors, labels, persistent_level)
     except Exception as exc:
         unreal.log_error(
             f"BB Unreal Export: automatic Level Instance creation failed ({exc}); "
             "falling back to selecting the actors instead"
         )
-        _select_actors_for_manual_level_instance(actors)
+        _select_actors_for_manual_level_instance(labels)
 
 
-def _create_level_instance_from_actors(actors):
+def _actors_by_label(labels):
+    actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    label_set = set(labels)
+    return [a for a in actor_subsystem.get_all_level_actors() if a.get_actor_label() in label_set]
+
+
+def _create_level_instance_from_actors(actors, labels, persistent_level):
     label = os.path.splitext(os.path.basename(JSON_PATH))[0]
     new_level_path = f"{CONTENT_PATH}/Levels/{label}"
 
@@ -211,7 +227,7 @@ def _create_level_instance_from_actors(actors):
             f"BB Unreal Export: level asset '{new_level_path}' already exists; "
             "falling back to selecting the actors instead of overwriting it"
         )
-        _select_actors_for_manual_level_instance(actors)
+        _select_actors_for_manual_level_instance(labels)
         return
 
     streaming_level = unreal.EditorLevelUtils.create_new_streaming_level(
@@ -225,30 +241,36 @@ def _create_level_instance_from_actors(actors):
     # move_actors_to_level can leave some newly-spawned actors behind on the
     # first call (observed to succeed on a second attempt -- likely the
     # actors/their imported meshes aren't fully settled in the editor yet
-    # right after spawning). Retry just the stragglers a few times rather
-    # than requiring the whole script to be run again, which would also
-    # re-spawn duplicates of the actors that already succeeded.
-    remaining = list(actors)
+    # right after spawning). Retry a few times using fresh actor references
+    # (re-resolved by label) rather than the original, now-possibly-invalid
+    # `actors` list.
+    to_move = actors
+    total = len(labels)
     moved_total = 0
+    remaining_labels = set(labels)
     for attempt in range(1, 4):
-        if not remaining:
+        if not to_move:
             break
-        moved = unreal.EditorLevelUtils.move_actors_to_level(remaining, streaming_level, False, False)
+        moved = unreal.EditorLevelUtils.move_actors_to_level(to_move, streaming_level, False, False)
         moved_total += moved
-        remaining = [a for a in remaining if a.get_level() != loaded_level]
-        if remaining:
-            unreal.log(f"BB Unreal Export: retrying move for {len(remaining)} actor(s) (attempt {attempt})")
 
-    unreal.log(f"BB Unreal Export: moved {moved_total}/{len(actors)} actor(s) into '{new_level_path}'")
+        still_in_persistent = _actors_by_label(remaining_labels)
+        still_in_persistent = [a for a in still_in_persistent if a.get_level() == persistent_level]
+        remaining_labels = {a.get_actor_label() for a in still_in_persistent}
+        to_move = still_in_persistent
+        if to_move:
+            unreal.log(f"BB Unreal Export: retrying move for {len(to_move)} actor(s) (attempt {attempt})")
 
-    if remaining:
-        names = ", ".join(a.get_actor_label() for a in remaining)
+    unreal.log(f"BB Unreal Export: moved {total - len(remaining_labels)}/{total} actor(s) into '{new_level_path}'")
+
+    if remaining_labels:
+        names = ", ".join(sorted(remaining_labels))
         unreal.log_warning(
-            f"BB Unreal Export: {len(remaining)} actor(s) were NOT moved into the "
+            f"BB Unreal Export: {len(remaining_labels)} actor(s) were NOT moved into the "
             f"Level Instance after 3 attempts and remain directly in the persistent level: {names}"
         )
         actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
-        actor_subsystem.set_selected_level_actors(remaining)
+        actor_subsystem.set_selected_level_actors(_actors_by_label(remaining_labels))
 
     unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)
     unreal.EditorLevelUtils.remove_level_from_world(loaded_level)
@@ -266,10 +288,11 @@ def _create_level_instance_from_actors(actors):
 
     instance_actor.set_editor_property("world_asset", level_world)
     instance_actor.set_actor_label(label, mark_dirty=True)
-    unreal.log(f"BB Unreal Export: created Level Instance '{label}' from {len(actors)} actor(s)")
+    unreal.log(f"BB Unreal Export: created Level Instance '{label}' from {total} actor(s)")
 
 
-def _select_actors_for_manual_level_instance(actors):
+def _select_actors_for_manual_level_instance(labels):
+    actors = _actors_by_label(labels)
     actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     actor_subsystem.set_selected_level_actors(actors)
     unreal.log(
