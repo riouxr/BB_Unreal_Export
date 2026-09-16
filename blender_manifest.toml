@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "bb_unreal_export"
-version = "1.3.1"
+version = "1.4.0"
 name = "BB Unreal Export"
 tagline = "Export selected objects as origin-centered FBX files plus a transforms JSON, for rebuilding the scene in Unreal"
 maintainer = "BB <riouxr@gmail.com>"

@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 3, 1),
+    "version": (1, 4, 0),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -124,6 +124,70 @@ def _source_fbx_name(obj):
     return _sanitize_filename(_export_key(obj)[1]) + ".fbx"
 
 
+def _export_objects_to_fbx(context, objects, directory):
+    view_layer = context.view_layer
+    groups = _group_by_export_key(objects)
+    exported = 0
+
+    for key, members in groups:
+        rep = members[0]
+        rep_name = _sanitize_filename(rep.name)
+        filepath = os.path.join(directory, rep_name + ".fbx")
+        if rep.type == 'MESH' and rep.data is not None:
+            rep.data["bb_unreal_export_name"] = rep_name
+        original_matrix = rep.matrix_world.copy()
+
+        bpy.ops.object.select_all(action='DESELECT')
+        rep.select_set(True)
+        view_layer.objects.active = rep
+
+        rep.matrix_world = Matrix.Identity(4)
+        view_layer.update()
+
+        try:
+            bpy.ops.export_scene.fbx(
+                filepath=filepath,
+                use_selection=True,
+                apply_unit_scale=False,
+                use_space_transform=True,
+                bake_space_transform=False,
+                global_scale=1.0,
+            )
+            exported += 1
+        finally:
+            rep.matrix_world = original_matrix
+            view_layer.update()
+
+    return exported
+
+
+def _write_transforms_json(objects, filepath):
+    entries = []
+    for obj in objects:
+        loc, rot, scale = obj.matrix_world.decompose()
+        entries.append({
+            "name": obj.name,
+            "source_fbx": _source_fbx_name(obj),
+            "location_m": [loc.x, loc.y, loc.z],
+            "rotation_quat_wxyz": [rot.w, rot.x, rot.y, rot.z],
+            "scale": [scale.x, scale.y, scale.z],
+            "parent": obj.parent.name if obj.parent else None,
+        })
+
+    data = {
+        "unit": "meters",
+        "up_axis": "Z",
+        "forward_axis": "-Y",
+        "handedness": "right",
+        "objects": entries,
+    }
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+    return len(entries)
+
+
 class BBUNREALEXPORT_OT_export_fbx(bpy.types.Operator):
     bl_idname = "bb_unreal_export.export_fbx"
     bl_label = "Export"
@@ -156,7 +220,7 @@ class BBUNREALEXPORT_OT_export_fbx(bpy.types.Operator):
             touched += 1
             target_dir = os.path.join(directory, _sanitize_filename(subfolder)) if subfolder else directory
             os.makedirs(target_dir, exist_ok=True)
-            total_exported += self._export_objects(context, objects, target_dir)
+            total_exported += _export_objects_to_fbx(context, objects, target_dir)
 
         bpy.ops.object.select_all(action='DESELECT')
         for obj in original_selected:
@@ -174,42 +238,6 @@ class BBUNREALEXPORT_OT_export_fbx(bpy.types.Operator):
                 return {'CANCELLED'}
             self.report({'INFO'}, f"Exported {total_exported} FBX file(s) to {directory}")
         return {'FINISHED'}
-
-    def _export_objects(self, context, objects, directory):
-        view_layer = context.view_layer
-        groups = _group_by_export_key(objects)
-        exported = 0
-
-        for key, members in groups:
-            rep = members[0]
-            rep_name = _sanitize_filename(rep.name)
-            filepath = os.path.join(directory, rep_name + ".fbx")
-            if rep.type == 'MESH' and rep.data is not None:
-                rep.data["bb_unreal_export_name"] = rep_name
-            original_matrix = rep.matrix_world.copy()
-
-            bpy.ops.object.select_all(action='DESELECT')
-            rep.select_set(True)
-            view_layer.objects.active = rep
-
-            rep.matrix_world = Matrix.Identity(4)
-            view_layer.update()
-
-            try:
-                bpy.ops.export_scene.fbx(
-                    filepath=filepath,
-                    use_selection=True,
-                    apply_unit_scale=False,
-                    use_space_transform=True,
-                    bake_space_transform=False,
-                    global_scale=1.0,
-                )
-                exported += 1
-            finally:
-                rep.matrix_world = original_matrix
-                view_layer.update()
-
-        return exported
 
 
 class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
@@ -245,7 +273,7 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
             touched += 1
             target_dir = os.path.join(directory, _sanitize_filename(subfolder)) if subfolder else directory
             os.makedirs(target_dir, exist_ok=True)
-            total_entries += self._write_transforms(objects, os.path.join(target_dir, json_name))
+            total_entries += _write_transforms_json(objects, os.path.join(target_dir, json_name))
 
         if context.scene.bb_unreal_export_per_collection:
             if touched == 0:
@@ -259,31 +287,70 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
             self.report({'INFO'}, f"Wrote {total_entries} transform(s) to {directory}")
         return {'FINISHED'}
 
-    def _write_transforms(self, objects, filepath):
-        entries = []
-        for obj in objects:
-            loc, rot, scale = obj.matrix_world.decompose()
-            entries.append({
-                "name": obj.name,
-                "source_fbx": _source_fbx_name(obj),
-                "location_m": [loc.x, loc.y, loc.z],
-                "rotation_quat_wxyz": [rot.w, rot.x, rot.y, rot.z],
-                "scale": [scale.x, scale.y, scale.z],
-                "parent": obj.parent.name if obj.parent else None,
-            })
 
-        data = {
-            "unit": "meters",
-            "up_axis": "Z",
-            "forward_axis": "-Y",
-            "handedness": "right",
-            "objects": entries,
-        }
+class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
+    bl_idname = "bb_unreal_export.export_all"
+    bl_label = "Export All"
+    bl_description = (
+        "Export FBX files and write the transforms JSON in one click. Reads the "
+        "current selection (or Outliner collection selection, if Per Collection "
+        "is on) once, so the two outputs can never end up out of sync with each "
+        "other from selection changing between separate clicks"
+    )
+    bl_options = {'REGISTER'}
 
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
+    def execute(self, context):
+        directory = bpy.path.abspath(context.scene.bb_unreal_export_directory)
+        if not directory:
+            self.report({'WARNING'}, "Set an export directory first")
+            return {'CANCELLED'}
 
-        return len(entries)
+        json_name = context.scene.bb_unreal_export_json_name.strip() or "bb_unreal_export_transforms.json"
+        if not json_name.lower().endswith(".json"):
+            json_name += ".json"
+        json_name = _sanitize_filename(os.path.splitext(json_name)[0]) + ".json"
+
+        # Captured once, up front, before any object-selection churn from the
+        # FBX export loop can affect the Outliner's collection selection.
+        targets = _export_targets(context)
+        per_collection = context.scene.bb_unreal_export_per_collection
+        if per_collection and not targets:
+            self.report({'WARNING'}, "No collections selected in the Outliner")
+            return {'CANCELLED'}
+
+        view_layer = context.view_layer
+        original_active = view_layer.objects.active
+        original_selected = list(context.selected_objects)
+
+        total_exported = 0
+        total_entries = 0
+        touched = 0
+        for subfolder, objects in targets:
+            if not objects:
+                continue
+            touched += 1
+            target_dir = os.path.join(directory, _sanitize_filename(subfolder)) if subfolder else directory
+            os.makedirs(target_dir, exist_ok=True)
+            total_exported += _export_objects_to_fbx(context, objects, target_dir)
+            total_entries += _write_transforms_json(objects, os.path.join(target_dir, json_name))
+
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in original_selected:
+            obj.select_set(True)
+        view_layer.objects.active = original_active
+
+        if touched == 0:
+            self.report({'WARNING'}, "Selected collection(s) have no objects" if per_collection else "No objects selected")
+            return {'CANCELLED'}
+
+        if per_collection:
+            self.report(
+                {'INFO'},
+                f"Exported {total_exported} FBX file(s) and {total_entries} transform(s) across {touched} collection(s)",
+            )
+        else:
+            self.report({'INFO'}, f"Exported {total_exported} FBX file(s) and {total_entries} transform(s) to {directory}")
+        return {'FINISHED'}
 
 
 class BBUNREALEXPORT_OT_renumber_objects(bpy.types.Operator):
@@ -358,8 +425,11 @@ class BBUNREALEXPORT_PT_panel(bpy.types.Panel):
 
         col = layout.column(align=True)
         col.scale_y = 1.5
-        col.operator("bb_unreal_export.export_fbx", text="Export", icon='EXPORT')
-        col.operator("bb_unreal_export.export_transforms", text="Export Geo Transforms", icon='FILE')
+        col.operator("bb_unreal_export.export_all", text="Export All", icon='EXPORT')
+
+        col2 = layout.column(align=True)
+        col2.operator("bb_unreal_export.export_fbx", text="Export FBX Only", icon='EXPORT')
+        col2.operator("bb_unreal_export.export_transforms", text="Export Geo Transforms Only", icon='FILE')
 
         layout.separator()
         layout.operator("bb_unreal_export.renumber_objects", text="Renumber Selected", icon='SORTALPHA')
@@ -368,6 +438,7 @@ class BBUNREALEXPORT_PT_panel(bpy.types.Panel):
 classes = (
     BBUNREALEXPORT_OT_export_fbx,
     BBUNREALEXPORT_OT_export_transforms,
+    BBUNREALEXPORT_OT_export_all,
     BBUNREALEXPORT_OT_renumber_objects,
     BBUNREALEXPORT_PT_panel,
 )
