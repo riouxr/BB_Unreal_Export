@@ -220,10 +220,21 @@ def _create_level_instance_from_actors(actors):
     if streaming_level is None:
         raise RuntimeError(f"create_new_streaming_level returned None for '{new_level_path}'")
 
+    loaded_level = streaming_level.get_loaded_level()
     moved = unreal.EditorLevelUtils.move_actors_to_level(actors, streaming_level, False, False)
     unreal.log(f"BB Unreal Export: moved {moved}/{len(actors)} actor(s) into '{new_level_path}'")
 
-    loaded_level = streaming_level.get_loaded_level()
+    if moved < len(actors):
+        stragglers = [a for a in actors if a.get_level() != loaded_level]
+        if stragglers:
+            names = ", ".join(a.get_actor_label() for a in stragglers)
+            unreal.log_warning(
+                f"BB Unreal Export: {len(stragglers)} actor(s) were NOT moved into the "
+                f"Level Instance and remain directly in the persistent level: {names}"
+            )
+            actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+            actor_subsystem.set_selected_level_actors(stragglers)
+
     unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)
     unreal.EditorLevelUtils.remove_level_from_world(loaded_level)
 
