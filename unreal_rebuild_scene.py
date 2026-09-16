@@ -12,7 +12,10 @@ Run inside the Unreal Editor's Python environment:
 
       exec(open(r"PATH_TO_THIS_FILE\\unreal_rebuild_scene.py").read())
 
-Edit the three settings below first.
+Edit the DEFAULT_* settings below first, or, when run via the "BB Unreal
+Export: Rebuild Scene" Tools menu entry, pick a JSON file from the prompt
+instead (that path is injected as BB_JSON_PATH before this file runs, and
+overrides DEFAULT_JSON_PATH below).
 """
 
 import unreal
@@ -20,10 +23,17 @@ import json
 import os
 
 # ---- USER SETTINGS -------------------------------------------------------
-JSON_PATH = r"E:\Epic\UDS_barcelona\bb_unreal_export_transforms.json"
-FBX_DIR = r"E:\Epic\UDS_barcelona"          # folder containing the exported .fbx files
-CONTENT_PATH = "/Game/BB_Unreal_Export"    # where imported static meshes will be placed
+DEFAULT_JSON_PATH = r"E:\Epic\UDS_barcelona\bb_unreal_export_transforms.json"
+CONTENT_PATH = "/Game/BB_Unreal_Export"      # where imported static meshes will be placed
+DEFAULT_CREATE_LEVEL_INSTANCE = True         # group the spawned actors into one Level Instance
 # ---------------------------------------------------------------------------
+
+# BB_JSON_PATH / BB_CREATE_LEVEL_INSTANCE are injected into globals() by the
+# Tools menu entry (file picker + checkbox); fall back to the defaults above
+# for manual runs pasted straight into the console.
+JSON_PATH = globals().get("BB_JSON_PATH") or DEFAULT_JSON_PATH
+FBX_DIR = os.path.dirname(JSON_PATH)         # exported .fbx files sit next to the JSON
+CREATE_LEVEL_INSTANCE = globals().get("BB_CREATE_LEVEL_INSTANCE", DEFAULT_CREATE_LEVEL_INSTANCE)
 
 
 def blender_to_unreal_location(loc_m):
@@ -89,7 +99,7 @@ def main():
     actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
 
     mesh_cache = {}
-    spawned = 0
+    spawned_actors = []
 
     for entry in objects:
         try:
@@ -120,12 +130,88 @@ def main():
 
             actor.set_actor_label(entry["name"], mark_dirty=True)
             actor.set_actor_scale3d(scale)
-            spawned += 1
+            spawned_actors.append(actor)
         except Exception as exc:
             unreal.log_error(f"BB Unreal Export: error on '{entry.get('name', '?')}': {exc}")
             continue
 
-    unreal.log(f"BB Unreal Export: spawned {spawned}/{len(objects)} actor(s)")
+    unreal.log(f"BB Unreal Export: spawned {len(spawned_actors)}/{len(objects)} actor(s)")
+
+    if CREATE_LEVEL_INSTANCE and spawned_actors:
+        group_actors_into_level_instance(spawned_actors)
+
+
+def group_actors_into_level_instance(actors):
+    # Unreal has no Python-exposed "Create Level Instance" action (confirmed:
+    # unreal.LevelInstanceSubsystem does not exist in the Python bindings) --
+    # it only exists as C++/editor-UI code. This rebuilds the same end result
+    # by hand using genuinely documented EditorLevelUtils APIs:
+    #   1. create a new Level asset
+    #   2. move the actors into it
+    #   3. spawn a LevelInstance actor at the world origin pointing at that
+    #      Level asset (identity transform means the moved actors' existing
+    #      world-space transforms are reproduced exactly, no pivot math needed)
+    # If any step fails, this falls back to just selecting the actors so the
+    # one remaining manual step (right-click > Level > Create Level Instance)
+    # is a single click instead of hunting for the actors first.
+    try:
+        _create_level_instance_from_actors(actors)
+    except Exception as exc:
+        unreal.log_error(
+            f"BB Unreal Export: automatic Level Instance creation failed ({exc}); "
+            "falling back to selecting the actors instead"
+        )
+        _select_actors_for_manual_level_instance(actors)
+
+
+def _create_level_instance_from_actors(actors):
+    label = os.path.splitext(os.path.basename(JSON_PATH))[0]
+    new_level_path = f"{CONTENT_PATH}/Levels/{label}"
+
+    if unreal.EditorAssetLibrary.does_asset_exist(new_level_path):
+        unreal.log_warning(
+            f"BB Unreal Export: level asset '{new_level_path}' already exists; "
+            "falling back to selecting the actors instead of overwriting it"
+        )
+        _select_actors_for_manual_level_instance(actors)
+        return
+
+    streaming_level = unreal.EditorLevelUtils.create_new_streaming_level(
+        unreal.LevelStreamingAlwaysLoaded, new_level_path, False
+    )
+    if streaming_level is None:
+        raise RuntimeError(f"create_new_streaming_level returned None for '{new_level_path}'")
+
+    moved = unreal.EditorLevelUtils.move_actors_to_level(actors, streaming_level, False, False)
+    unreal.log(f"BB Unreal Export: moved {moved}/{len(actors)} actor(s) into '{new_level_path}'")
+
+    loaded_level = streaming_level.get_loaded_level()
+    unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)
+    unreal.EditorLevelUtils.remove_level_from_world(loaded_level)
+
+    level_world = unreal.EditorAssetLibrary.load_asset(new_level_path)
+    if level_world is None:
+        raise RuntimeError(f"could not load new level asset at '{new_level_path}' after creation")
+
+    actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    instance_actor = actor_subsystem.spawn_actor_from_class(
+        unreal.LevelInstance, unreal.Vector(0.0, 0.0, 0.0), unreal.Rotator(0.0, 0.0, 0.0)
+    )
+    if instance_actor is None:
+        raise RuntimeError("spawn_actor_from_class(unreal.LevelInstance, ...) returned None")
+
+    instance_actor.set_editor_property("world_asset", level_world)
+    instance_actor.set_actor_label(label, mark_dirty=True)
+    unreal.log(f"BB Unreal Export: created Level Instance '{label}' from {len(actors)} actor(s)")
+
+
+def _select_actors_for_manual_level_instance(actors):
+    actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    actor_subsystem.set_selected_level_actors(actors)
+    unreal.log(
+        f"BB Unreal Export: selected {len(actors)} actor(s). Right-click one of them "
+        "in the Outliner or Viewport and choose Level > Create Level Instance to finish."
+    )
 
 
 main()

@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -172,6 +172,11 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
             return {'CANCELLED'}
         os.makedirs(directory, exist_ok=True)
 
+        json_name = context.scene.bb_unreal_export_json_name.strip() or "bb_unreal_export_transforms.json"
+        if not json_name.lower().endswith(".json"):
+            json_name += ".json"
+        json_name = _sanitize_filename(os.path.splitext(json_name)[0]) + ".json"
+
         entries = []
         for obj in selected:
             loc, rot, scale = obj.matrix_world.decompose()
@@ -192,7 +197,7 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
             "objects": entries,
         }
 
-        filepath = os.path.join(directory, "bb_unreal_export_transforms.json")
+        filepath = os.path.join(directory, json_name)
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
 
@@ -264,6 +269,7 @@ class BBUNREALEXPORT_PT_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         layout.prop(context.scene, "bb_unreal_export_directory", text="")
+        layout.prop(context.scene, "bb_unreal_export_json_name", text="")
 
         col = layout.column(align=True)
         col.scale_y = 1.5
@@ -291,9 +297,18 @@ def register():
         subtype='DIR_PATH',
         default="//",
     )
+    bpy.types.Scene.bb_unreal_export_json_name = bpy.props.StringProperty(
+        name="Transforms File",
+        description=(
+            "Filename for the transforms JSON (.json added automatically). "
+            "Change this between exports so you don't overwrite a previous one"
+        ),
+        default="bb_unreal_export_transforms.json",
+    )
 
 
 def unregister():
+    del bpy.types.Scene.bb_unreal_export_json_name
     del bpy.types.Scene.bb_unreal_export_directory
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
