@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -75,6 +75,23 @@ def _split_base_and_number(name):
     return core, None, blend_suffix
 
 
+def _selected_collections(context):
+    # Collections selected in the Outliner show up in context.selected_ids
+    # alongside any selected objects/materials/etc.
+    return [c for c in context.selected_ids if isinstance(c, bpy.types.Collection)]
+
+
+def _export_targets(context):
+    # Returns a list of (subfolder_name_or_None, objects) pairs: one entry
+    # per selected collection when Per Collection is on (each collection's
+    # objects, including nested sub-collections, going to their own
+    # subfolder), or a single entry for the current object selection.
+    if context.scene.bb_unreal_export_per_collection:
+        collections = _selected_collections(context)
+        return [(c.name, list(c.all_objects)) for c in collections]
+    return [(None, list(context.selected_objects))]
+
+
 def _source_fbx_name(obj):
     # The FBX is named after the representative object that was actually
     # exported for this mesh data (see BBUNREALEXPORT_OT_export_fbx), so the
@@ -96,21 +113,50 @@ class BBUNREALEXPORT_OT_export_fbx(bpy.types.Operator):
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        selected = list(context.selected_objects)
-        if not selected:
-            self.report({'WARNING'}, "No objects selected")
-            return {'CANCELLED'}
-
         directory = bpy.path.abspath(context.scene.bb_unreal_export_directory)
         if not directory:
             self.report({'WARNING'}, "Set an export directory first")
             return {'CANCELLED'}
-        os.makedirs(directory, exist_ok=True)
+
+        targets = _export_targets(context)
+        if context.scene.bb_unreal_export_per_collection and not targets:
+            self.report({'WARNING'}, "No collections selected in the Outliner")
+            return {'CANCELLED'}
 
         view_layer = context.view_layer
         original_active = view_layer.objects.active
+        original_selected = list(context.selected_objects)
 
-        groups = _group_by_export_key(selected)
+        total_exported = 0
+        touched = 0
+        for subfolder, objects in targets:
+            if not objects:
+                continue
+            touched += 1
+            target_dir = os.path.join(directory, _sanitize_filename(subfolder)) if subfolder else directory
+            os.makedirs(target_dir, exist_ok=True)
+            total_exported += self._export_objects(context, objects, target_dir)
+
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in original_selected:
+            obj.select_set(True)
+        view_layer.objects.active = original_active
+
+        if context.scene.bb_unreal_export_per_collection:
+            if touched == 0:
+                self.report({'WARNING'}, "Selected collection(s) have no objects")
+                return {'CANCELLED'}
+            self.report({'INFO'}, f"Exported {total_exported} FBX file(s) across {touched} collection(s)")
+        else:
+            if touched == 0:
+                self.report({'WARNING'}, "No objects selected")
+                return {'CANCELLED'}
+            self.report({'INFO'}, f"Exported {total_exported} FBX file(s) to {directory}")
+        return {'FINISHED'}
+
+    def _export_objects(self, context, objects, directory):
+        view_layer = context.view_layer
+        groups = _group_by_export_key(objects)
         exported = 0
 
         for key, members in groups:
@@ -142,13 +188,7 @@ class BBUNREALEXPORT_OT_export_fbx(bpy.types.Operator):
                 rep.matrix_world = original_matrix
                 view_layer.update()
 
-        bpy.ops.object.select_all(action='DESELECT')
-        for obj in selected:
-            obj.select_set(True)
-        view_layer.objects.active = original_active
-
-        self.report({'INFO'}, f"Exported {exported} FBX file(s) to {directory}")
-        return {'FINISHED'}
+        return exported
 
 
 class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
@@ -161,24 +201,46 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        selected = list(context.selected_objects)
-        if not selected:
-            self.report({'WARNING'}, "No objects selected")
-            return {'CANCELLED'}
-
         directory = bpy.path.abspath(context.scene.bb_unreal_export_directory)
         if not directory:
             self.report({'WARNING'}, "Set an export directory first")
             return {'CANCELLED'}
-        os.makedirs(directory, exist_ok=True)
 
         json_name = context.scene.bb_unreal_export_json_name.strip() or "bb_unreal_export_transforms.json"
         if not json_name.lower().endswith(".json"):
             json_name += ".json"
         json_name = _sanitize_filename(os.path.splitext(json_name)[0]) + ".json"
 
+        targets = _export_targets(context)
+        if context.scene.bb_unreal_export_per_collection and not targets:
+            self.report({'WARNING'}, "No collections selected in the Outliner")
+            return {'CANCELLED'}
+
+        total_entries = 0
+        touched = 0
+        for subfolder, objects in targets:
+            if not objects:
+                continue
+            touched += 1
+            target_dir = os.path.join(directory, _sanitize_filename(subfolder)) if subfolder else directory
+            os.makedirs(target_dir, exist_ok=True)
+            total_entries += self._write_transforms(objects, os.path.join(target_dir, json_name))
+
+        if context.scene.bb_unreal_export_per_collection:
+            if touched == 0:
+                self.report({'WARNING'}, "Selected collection(s) have no objects")
+                return {'CANCELLED'}
+            self.report({'INFO'}, f"Wrote {total_entries} transform(s) across {touched} collection(s)")
+        else:
+            if touched == 0:
+                self.report({'WARNING'}, "No objects selected")
+                return {'CANCELLED'}
+            self.report({'INFO'}, f"Wrote {total_entries} transform(s) to {directory}")
+        return {'FINISHED'}
+
+    def _write_transforms(self, objects, filepath):
         entries = []
-        for obj in selected:
+        for obj in objects:
             loc, rot, scale = obj.matrix_world.decompose()
             entries.append({
                 "name": obj.name,
@@ -197,12 +259,10 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
             "objects": entries,
         }
 
-        filepath = os.path.join(directory, json_name)
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
 
-        self.report({'INFO'}, f"Wrote {len(entries)} transform(s) to {filepath}")
-        return {'FINISHED'}
+        return len(entries)
 
 
 class BBUNREALEXPORT_OT_renumber_objects(bpy.types.Operator):
@@ -270,6 +330,10 @@ class BBUNREALEXPORT_PT_panel(bpy.types.Panel):
         layout = self.layout
         layout.prop(context.scene, "bb_unreal_export_directory", text="")
         layout.prop(context.scene, "bb_unreal_export_json_name", text="")
+        layout.prop(
+            context.scene, "bb_unreal_export_per_collection",
+            text="Per Collection", toggle=True, icon='OUTLINER_COLLECTION',
+        )
 
         col = layout.column(align=True)
         col.scale_y = 1.5
@@ -305,9 +369,19 @@ def register():
         ),
         default="bb_unreal_export_transforms.json",
     )
+    bpy.types.Scene.bb_unreal_export_per_collection = bpy.props.BoolProperty(
+        name="Per Collection",
+        description=(
+            "Export every object in each collection selected in the Outliner "
+            "into its own subfolder (named after the collection), instead of "
+            "using the current viewport object selection"
+        ),
+        default=False,
+    )
 
 
 def unregister():
+    del bpy.types.Scene.bb_unreal_export_per_collection
     del bpy.types.Scene.bb_unreal_export_json_name
     del bpy.types.Scene.bb_unreal_export_directory
     for cls in reversed(classes):
