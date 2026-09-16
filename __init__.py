@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 5, 0),
+    "version": (1, 5, 1),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -237,7 +237,8 @@ class BBUNREALEXPORT_OT_export_fbx(bpy.types.Operator):
         bpy.ops.object.select_all(action='DESELECT')
         for obj in original_selected:
             obj.select_set(True)
-        view_layer.objects.active = original_active
+        if original_active is not None:
+            view_layer.objects.active = original_active
 
         if context.scene.bb_unreal_export_per_collection:
             if touched == 0:
@@ -341,7 +342,8 @@ class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
         bpy.ops.object.select_all(action='DESELECT')
         for obj in original_selected:
             obj.select_set(True)
-        view_layer.objects.active = original_active
+        if original_active is not None:
+            view_layer.objects.active = original_active
 
         if touched == 0:
             self.report({'WARNING'}, "Selected collection(s) have no objects" if per_collection else "No objects selected")
