@@ -30,6 +30,17 @@ DEFAULT_IMPORT_MATERIALS = True              # import materials/textures from th
 # ---------------------------------------------------------------------------
 
 
+def _normalize_content_path(path):
+    # The Content Browser's "All" view (multiple mounted content roots shown
+    # together) prefixes highlighted folder paths with a virtual /All root,
+    # e.g. /All/Game/Buildings/Building_01. That's a display-only path -- it
+    # is not a real package path and every asset/import call using it as-is
+    # fails silently (DoesAssetExist errors, imports refused). Strip it.
+    if path.startswith("/All/"):
+        path = path[len("/All"):]
+    return path.rstrip("/")
+
+
 def _resolve_content_path():
     # Prefer whichever folder is highlighted in the Content Browser's path
     # view (the left-hand folder tree), falling back to a general "selected
@@ -43,8 +54,9 @@ def _resolve_content_path():
         except Exception:
             paths = None
         if paths:
-            unreal.log(f"BB Unreal Export: importing into highlighted Content Browser folder '{paths[0]}'")
-            return paths[0]
+            resolved = _normalize_content_path(paths[0])
+            unreal.log(f"BB Unreal Export: importing into highlighted Content Browser folder '{resolved}'")
+            return resolved
     unreal.log(f"BB Unreal Export: no folder highlighted in Content Browser, using default '{DEFAULT_CONTENT_PATH}'")
     return DEFAULT_CONTENT_PATH
 
@@ -57,7 +69,7 @@ JSON_PATH = globals().get("BB_JSON_PATH") or DEFAULT_JSON_PATH
 FBX_DIR = os.path.dirname(JSON_PATH)         # exported .fbx files sit next to the JSON
 CREATE_LEVEL_INSTANCE = globals().get("BB_CREATE_LEVEL_INSTANCE", DEFAULT_CREATE_LEVEL_INSTANCE)
 IMPORT_MATERIALS = globals().get("BB_IMPORT_MATERIALS", DEFAULT_IMPORT_MATERIALS)
-CONTENT_PATH = globals().get("BB_CONTENT_PATH") or _resolve_content_path()
+CONTENT_PATH = _normalize_content_path(globals().get("BB_CONTENT_PATH") or _resolve_content_path())
 
 
 def blender_to_unreal_location(loc_m):
