@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 4, 0),
+    "version": (1, 4, 1),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -100,6 +100,18 @@ def _selected_collections(context):
             except AttributeError:
                 continue
     return collections
+
+
+def _json_filename(context, subfolder):
+    # In Per Collection mode the JSON is named after the collection itself
+    # (one self-contained pair of FBX + JSON per collection); otherwise it
+    # uses the user-provided Transforms File name.
+    if context.scene.bb_unreal_export_per_collection and subfolder:
+        return _sanitize_filename(subfolder) + ".json"
+    name = context.scene.bb_unreal_export_json_name.strip() or "bb_unreal_export_transforms.json"
+    if not name.lower().endswith(".json"):
+        name += ".json"
+    return _sanitize_filename(os.path.splitext(name)[0]) + ".json"
 
 
 def _export_targets(context):
@@ -255,11 +267,6 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
             self.report({'WARNING'}, "Set an export directory first")
             return {'CANCELLED'}
 
-        json_name = context.scene.bb_unreal_export_json_name.strip() or "bb_unreal_export_transforms.json"
-        if not json_name.lower().endswith(".json"):
-            json_name += ".json"
-        json_name = _sanitize_filename(os.path.splitext(json_name)[0]) + ".json"
-
         targets = _export_targets(context)
         if context.scene.bb_unreal_export_per_collection and not targets:
             self.report({'WARNING'}, "No collections selected in the Outliner")
@@ -273,6 +280,7 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
             touched += 1
             target_dir = os.path.join(directory, _sanitize_filename(subfolder)) if subfolder else directory
             os.makedirs(target_dir, exist_ok=True)
+            json_name = _json_filename(context, subfolder)
             total_entries += _write_transforms_json(objects, os.path.join(target_dir, json_name))
 
         if context.scene.bb_unreal_export_per_collection:
@@ -305,11 +313,6 @@ class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
             self.report({'WARNING'}, "Set an export directory first")
             return {'CANCELLED'}
 
-        json_name = context.scene.bb_unreal_export_json_name.strip() or "bb_unreal_export_transforms.json"
-        if not json_name.lower().endswith(".json"):
-            json_name += ".json"
-        json_name = _sanitize_filename(os.path.splitext(json_name)[0]) + ".json"
-
         # Captured once, up front, before any object-selection churn from the
         # FBX export loop can affect the Outliner's collection selection.
         targets = _export_targets(context)
@@ -332,6 +335,7 @@ class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
             target_dir = os.path.join(directory, _sanitize_filename(subfolder)) if subfolder else directory
             os.makedirs(target_dir, exist_ok=True)
             total_exported += _export_objects_to_fbx(context, objects, target_dir)
+            json_name = _json_filename(context, subfolder)
             total_entries += _write_transforms_json(objects, os.path.join(target_dir, json_name))
 
         bpy.ops.object.select_all(action='DESELECT')
@@ -417,7 +421,8 @@ class BBUNREALEXPORT_PT_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         layout.prop(context.scene, "bb_unreal_export_directory", text="")
-        layout.prop(context.scene, "bb_unreal_export_json_name", text="")
+        if not context.scene.bb_unreal_export_per_collection:
+            layout.prop(context.scene, "bb_unreal_export_json_name", text="")
         layout.prop(
             context.scene, "bb_unreal_export_per_collection",
             text="Per Collection", toggle=True, icon='OUTLINER_COLLECTION',
