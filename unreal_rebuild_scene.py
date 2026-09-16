@@ -221,19 +221,34 @@ def _create_level_instance_from_actors(actors):
         raise RuntimeError(f"create_new_streaming_level returned None for '{new_level_path}'")
 
     loaded_level = streaming_level.get_loaded_level()
-    moved = unreal.EditorLevelUtils.move_actors_to_level(actors, streaming_level, False, False)
-    unreal.log(f"BB Unreal Export: moved {moved}/{len(actors)} actor(s) into '{new_level_path}'")
 
-    if moved < len(actors):
-        stragglers = [a for a in actors if a.get_level() != loaded_level]
-        if stragglers:
-            names = ", ".join(a.get_actor_label() for a in stragglers)
-            unreal.log_warning(
-                f"BB Unreal Export: {len(stragglers)} actor(s) were NOT moved into the "
-                f"Level Instance and remain directly in the persistent level: {names}"
-            )
-            actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
-            actor_subsystem.set_selected_level_actors(stragglers)
+    # move_actors_to_level can leave some newly-spawned actors behind on the
+    # first call (observed to succeed on a second attempt -- likely the
+    # actors/their imported meshes aren't fully settled in the editor yet
+    # right after spawning). Retry just the stragglers a few times rather
+    # than requiring the whole script to be run again, which would also
+    # re-spawn duplicates of the actors that already succeeded.
+    remaining = list(actors)
+    moved_total = 0
+    for attempt in range(1, 4):
+        if not remaining:
+            break
+        moved = unreal.EditorLevelUtils.move_actors_to_level(remaining, streaming_level, False, False)
+        moved_total += moved
+        remaining = [a for a in remaining if a.get_level() != loaded_level]
+        if remaining:
+            unreal.log(f"BB Unreal Export: retrying move for {len(remaining)} actor(s) (attempt {attempt})")
+
+    unreal.log(f"BB Unreal Export: moved {moved_total}/{len(actors)} actor(s) into '{new_level_path}'")
+
+    if remaining:
+        names = ", ".join(a.get_actor_label() for a in remaining)
+        unreal.log_warning(
+            f"BB Unreal Export: {len(remaining)} actor(s) were NOT moved into the "
+            f"Level Instance after 3 attempts and remain directly in the persistent level: {names}"
+        )
+        actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+        actor_subsystem.set_selected_level_actors(remaining)
 
     unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)
     unreal.EditorLevelUtils.remove_level_from_world(loaded_level)
