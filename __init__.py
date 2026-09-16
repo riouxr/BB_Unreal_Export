@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 3, 0),
+    "version": (1, 3, 1),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -76,9 +76,30 @@ def _split_base_and_number(name):
 
 
 def _selected_collections(context):
-    # Collections selected in the Outliner show up in context.selected_ids
-    # alongside any selected objects/materials/etc.
-    return [c for c in context.selected_ids if isinstance(c, bpy.types.Collection)]
+    # context.selected_ids (Outliner selection) only exists when the operator
+    # is invoked from inside the Outliner itself -- this button lives in the
+    # View3D panel, so that context member isn't present there. Instead, find
+    # any open Outliner area/region and read its selection via a context
+    # override, merging results across every Outliner editor found.
+    collections = []
+    seen = set()
+    wm = context.window_manager
+    for window in wm.windows:
+        for area in window.screen.areas:
+            if area.type != 'OUTLINER':
+                continue
+            region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+            if region is None:
+                continue
+            try:
+                with context.temp_override(window=window, area=area, region=region):
+                    for item in bpy.context.selected_ids:
+                        if isinstance(item, bpy.types.Collection) and item.name not in seen:
+                            seen.add(item.name)
+                            collections.append(item)
+            except AttributeError:
+                continue
+    return collections
 
 
 def _export_targets(context):
