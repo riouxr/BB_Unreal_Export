@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -55,6 +55,24 @@ def _group_by_export_key(objects):
             order.append(key)
         groups[key].append(obj)
     return [(key, groups[key]) for key in order]
+
+
+def _split_base_and_number(name):
+    # Strip Blender's own uniqueness suffix (e.g. "foo_01.001" -> "foo_01"),
+    # then split the remaining name into a text prefix and its trailing digits
+    # (e.g. "foo_01" -> "foo_", "01"), so a duplicate chain can be renumbered
+    # as foo_01, foo_02, foo_03, ... instead of foo_01, foo_01.001, foo_01.002.
+    blend_suffix = None
+    core = name
+    m = re.match(r'^(.*)\.(\d{3})$', name)
+    if m:
+        core = m.group(1)
+        blend_suffix = int(m.group(2))
+
+    m2 = re.match(r'^(.*?)(\d+)$', core)
+    if m2:
+        return m2.group(1), m2.group(2), blend_suffix
+    return core, None, blend_suffix
 
 
 def _source_fbx_name(obj):
@@ -182,6 +200,60 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class BBUNREALEXPORT_OT_renumber_objects(bpy.types.Operator):
+    bl_idname = "bb_unreal_export.renumber_objects"
+    bl_label = "Renumber Selected"
+    bl_description = (
+        "Rename selected duplicates of a numbered object (e.g. foo_01) so they "
+        "become foo_02, foo_03, ... instead of Blender's automatic foo_01.001, "
+        "foo_01.002 suffixes"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        selected = list(context.selected_objects)
+        if not selected:
+            self.report({'WARNING'}, "No objects selected")
+            return {'CANCELLED'}
+
+        groups = {}
+        skipped = 0
+        for obj in selected:
+            prefix, digits, blend_suffix = _split_base_and_number(obj.name)
+            if digits is None:
+                skipped += 1
+                continue
+            groups.setdefault(prefix, []).append((obj, digits, blend_suffix))
+
+        if not groups:
+            self.report({'WARNING'}, "No numbered base names found in selection")
+            return {'CANCELLED'}
+
+        renamed = 0
+        for prefix, members in groups.items():
+            members.sort(key=lambda m: (0, 0) if m[2] is None else (1, m[2]))
+            width = len(members[0][1])
+            start = int(members[0][1])
+
+            # Rename through unique temporary names first so intermediate
+            # assignments never collide with another member of the group.
+            temp_pairs = []
+            for i, (obj, digits, blend_suffix) in enumerate(members):
+                temp_name = f"__bb_renumber_tmp_{i}__{obj.name}"
+                obj.name = temp_name
+                temp_pairs.append(obj)
+
+            for i, obj in enumerate(temp_pairs):
+                obj.name = f"{prefix}{start + i:0{width}d}"
+                renamed += 1
+
+        message = f"Renumbered {renamed} object(s)"
+        if skipped:
+            message += f", skipped {skipped} with no trailing number"
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+
 class BBUNREALEXPORT_PT_panel(bpy.types.Panel):
     bl_label = "BB Unreal Export"
     bl_idname = "BBUNREALEXPORT_PT_panel"
@@ -198,10 +270,14 @@ class BBUNREALEXPORT_PT_panel(bpy.types.Panel):
         col.operator("bb_unreal_export.export_fbx", text="Export", icon='EXPORT')
         col.operator("bb_unreal_export.export_transforms", text="Export Geo Transforms", icon='FILE')
 
+        layout.separator()
+        layout.operator("bb_unreal_export.renumber_objects", text="Renumber Selected", icon='SORTALPHA')
+
 
 classes = (
     BBUNREALEXPORT_OT_export_fbx,
     BBUNREALEXPORT_OT_export_transforms,
+    BBUNREALEXPORT_OT_renumber_objects,
     BBUNREALEXPORT_PT_panel,
 )
 
