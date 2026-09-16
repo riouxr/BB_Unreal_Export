@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "bb_unreal_export"
+version = "1.0.0"
+name = "BB Unreal Export"
+tagline = "Export selected objects as origin-centered FBX files plus a transforms JSON, for rebuilding the scene in Unreal"
+maintainer = "BB <riouxr@gmail.com>"
+type = "add-on"
+
+tags = ["Import-Export"]
+
+blender_version_min = "4.5.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
