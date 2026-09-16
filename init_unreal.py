@@ -32,13 +32,18 @@ DEFAULT_BROWSE_DIR = r"E:\Epic\UDS_barcelona"
 _last_browse_dir = DEFAULT_BROWSE_DIR
 
 
-def _run_prompt_flow(initial_dir, default_create_level_instance):
+def _run_prompt_flow(initial_dir, default_create_level_instance, default_import_materials):
     # A single shared Tk() root drives both dialogs. Tkinter only supports one
     # live root interpreter per process -- creating a second Tk() after the
     # first is destroyed leaves Tcl/Tk in a broken state (this previously
     # crashed the editor). The checkbox dialog is a Toplevel of this same
     # root, closed with wait_window() rather than a second mainloop().
-    result = {"json_path": "", "confirmed": False, "create_level_instance": default_create_level_instance}
+    result = {
+        "json_path": "",
+        "confirmed": False,
+        "create_level_instance": default_create_level_instance,
+        "import_materials": default_import_materials,
+    }
 
     root = tk.Tk()
     root.withdraw()
@@ -60,18 +65,23 @@ def _run_prompt_flow(initial_dir, default_create_level_instance):
         dialog.attributes("-topmost", True)
         dialog.resizable(False, False)
 
-        var = tk.BooleanVar(master=dialog, value=default_create_level_instance)
+        level_instance_var = tk.BooleanVar(master=dialog, value=default_create_level_instance)
+        materials_var = tk.BooleanVar(master=dialog, value=default_import_materials)
 
         tk.Label(dialog, text="Rebuild Scene").pack(pady=14)
         tk.Checkbutton(
-            dialog, text="Group spawned actors into a Level Instance", variable=var
+            dialog, text="Group spawned actors into a Level Instance", variable=level_instance_var
+        ).pack(padx=16, pady=4, anchor="w")
+        tk.Checkbutton(
+            dialog, text="Import materials", variable=materials_var
         ).pack(padx=16, pady=4, anchor="w")
 
         button_frame = tk.Frame(dialog)
         button_frame.pack(pady=10)
 
         def on_rebuild():
-            result["create_level_instance"] = var.get()
+            result["create_level_instance"] = level_instance_var.get()
+            result["import_materials"] = materials_var.get()
             result["confirmed"] = True
             dialog.destroy()
 
@@ -98,7 +108,9 @@ class BBUnrealExportRebuildEntry(unreal.ToolMenuEntryScript):
         global _last_browse_dir
 
         try:
-            options = _run_prompt_flow(_last_browse_dir, default_create_level_instance=True)
+            options = _run_prompt_flow(
+                _last_browse_dir, default_create_level_instance=True, default_import_materials=True
+            )
         except Exception as exc:
             unreal.log_error(f"BB Unreal Export: prompt failed ({exc})")
             return
@@ -120,6 +132,7 @@ class BBUnrealExportRebuildEntry(unreal.ToolMenuEntryScript):
                     "__name__": "__main__",
                     "BB_JSON_PATH": json_path,
                     "BB_CREATE_LEVEL_INSTANCE": options["create_level_instance"],
+                    "BB_IMPORT_MATERIALS": options["import_materials"],
                 },
             )
 

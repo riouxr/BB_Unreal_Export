@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 4, 1),
+    "version": (1, 5, 0),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -357,13 +357,77 @@ class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class BBUNREALEXPORT_OT_renumber_objects(bpy.types.Operator):
-    bl_idname = "bb_unreal_export.renumber_objects"
-    bl_label = "Renumber Selected"
+def _renumber_objects(objects):
+    # Rename a selected chain of duplicates (e.g. foo_01, foo_01.001,
+    # foo_01.002) to foo_01, foo_02, foo_03, ... using the original's
+    # zero-padded numeric style instead of Blender's automatic suffix.
+    groups = {}
+    skipped = 0
+    for obj in objects:
+        prefix, digits, blend_suffix = _split_base_and_number(obj.name)
+        if digits is None:
+            skipped += 1
+            continue
+        groups.setdefault(prefix, []).append((obj, digits, blend_suffix))
+
+    renamed = 0
+    for prefix, members in groups.items():
+        members.sort(key=lambda m: (0, 0) if m[2] is None else (1, m[2]))
+        width = len(members[0][1])
+        start = int(members[0][1])
+
+        # Rename through unique temporary names first so intermediate
+        # assignments never collide with another member of the group.
+        temp_objs = []
+        for i, (obj, digits, blend_suffix) in enumerate(members):
+            obj.name = f"__bb_renumber_tmp_{i}__{obj.name}"
+            temp_objs.append(obj)
+
+        for i, obj in enumerate(temp_objs):
+            obj.name = f"{prefix}{start + i:0{width}d}"
+            renamed += 1
+
+    return renamed, skipped
+
+
+def _relink_copies_as_instances(objects):
+    # Group by the *current* name (post-renumber, so foo_01/foo_02/foo_03
+    # naming is consistent), and for each group make every member share the
+    # mesh data of the lowest-numbered member -- turning a "Make Single
+    # User"/non-linked duplicate (its own separate mesh copy) back into a
+    # proper linked instance (shared mesh data), which is what lets the
+    # exporter dedupe them into a single FBX.
+    groups = {}
+    for obj in objects:
+        if obj.type != 'MESH' or obj.data is None:
+            continue
+        prefix, digits, _ = _split_base_and_number(obj.name)
+        if digits is None:
+            continue
+        groups.setdefault(prefix, []).append((obj, int(digits)))
+
+    relinked = 0
+    for prefix, members in groups.items():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda m: m[1])
+        original_data = members[0][0].data
+        for obj, _ in members[1:]:
+            if obj.data is not original_data:
+                obj.data = original_data
+                relinked += 1
+
+    return relinked
+
+
+class BBUNREALEXPORT_OT_cleanup(bpy.types.Operator):
+    bl_idname = "bb_unreal_export.cleanup"
+    bl_label = "Cleanup"
     bl_description = (
-        "Rename selected duplicates of a numbered object (e.g. foo_01) so they "
-        "become foo_02, foo_03, ... instead of Blender's automatic foo_01.001, "
-        "foo_01.002 suffixes"
+        "Renumber selected duplicates (foo_01.001 -> foo_02, ...), then make "
+        "any full-copy duplicates share the same mesh data as the "
+        "lowest-numbered object in their group, turning copies back into "
+        "linked instances"
     )
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -373,38 +437,14 @@ class BBUNREALEXPORT_OT_renumber_objects(bpy.types.Operator):
             self.report({'WARNING'}, "No objects selected")
             return {'CANCELLED'}
 
-        groups = {}
-        skipped = 0
-        for obj in selected:
-            prefix, digits, blend_suffix = _split_base_and_number(obj.name)
-            if digits is None:
-                skipped += 1
-                continue
-            groups.setdefault(prefix, []).append((obj, digits, blend_suffix))
-
-        if not groups:
+        renamed, skipped = _renumber_objects(selected)
+        if renamed == 0 and skipped == len(selected):
             self.report({'WARNING'}, "No numbered base names found in selection")
             return {'CANCELLED'}
 
-        renamed = 0
-        for prefix, members in groups.items():
-            members.sort(key=lambda m: (0, 0) if m[2] is None else (1, m[2]))
-            width = len(members[0][1])
-            start = int(members[0][1])
+        relinked = _relink_copies_as_instances(selected)
 
-            # Rename through unique temporary names first so intermediate
-            # assignments never collide with another member of the group.
-            temp_pairs = []
-            for i, (obj, digits, blend_suffix) in enumerate(members):
-                temp_name = f"__bb_renumber_tmp_{i}__{obj.name}"
-                obj.name = temp_name
-                temp_pairs.append(obj)
-
-            for i, obj in enumerate(temp_pairs):
-                obj.name = f"{prefix}{start + i:0{width}d}"
-                renamed += 1
-
-        message = f"Renumbered {renamed} object(s)"
+        message = f"Renumbered {renamed} object(s), relinked {relinked} cop{'y' if relinked == 1 else 'ies'} to shared mesh data"
         if skipped:
             message += f", skipped {skipped} with no trailing number"
         self.report({'INFO'}, message)
@@ -423,6 +463,9 @@ class BBUNREALEXPORT_PT_panel(bpy.types.Panel):
         layout.prop(context.scene, "bb_unreal_export_directory", text="")
         if not context.scene.bb_unreal_export_per_collection:
             layout.prop(context.scene, "bb_unreal_export_json_name", text="")
+
+        layout.operator("bb_unreal_export.cleanup", text="Cleanup", icon='SORTALPHA')
+
         layout.prop(
             context.scene, "bb_unreal_export_per_collection",
             text="Per Collection", toggle=True, icon='OUTLINER_COLLECTION',
@@ -436,15 +479,12 @@ class BBUNREALEXPORT_PT_panel(bpy.types.Panel):
         col2.operator("bb_unreal_export.export_fbx", text="Export FBX Only", icon='EXPORT')
         col2.operator("bb_unreal_export.export_transforms", text="Export Geo Transforms Only", icon='FILE')
 
-        layout.separator()
-        layout.operator("bb_unreal_export.renumber_objects", text="Renumber Selected", icon='SORTALPHA')
-
 
 classes = (
     BBUNREALEXPORT_OT_export_fbx,
     BBUNREALEXPORT_OT_export_transforms,
     BBUNREALEXPORT_OT_export_all,
-    BBUNREALEXPORT_OT_renumber_objects,
+    BBUNREALEXPORT_OT_cleanup,
     BBUNREALEXPORT_PT_panel,
 )
 

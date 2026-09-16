@@ -24,16 +24,40 @@ import os
 
 # ---- USER SETTINGS -------------------------------------------------------
 DEFAULT_JSON_PATH = r"E:\Epic\UDS_barcelona\bb_unreal_export_transforms.json"
-CONTENT_PATH = "/Game/BB_Unreal_Export"      # where imported static meshes will be placed
+DEFAULT_CONTENT_PATH = "/Game/BB_Unreal_Export"  # used only if no folder is highlighted in the Content Browser
 DEFAULT_CREATE_LEVEL_INSTANCE = True         # group the spawned actors into one Level Instance
+DEFAULT_IMPORT_MATERIALS = True              # import materials/textures from the FBX
 # ---------------------------------------------------------------------------
 
-# BB_JSON_PATH / BB_CREATE_LEVEL_INSTANCE are injected into globals() by the
-# Tools menu entry (file picker + checkbox); fall back to the defaults above
-# for manual runs pasted straight into the console.
+
+def _resolve_content_path():
+    # Prefer whichever folder is highlighted in the Content Browser's path
+    # view (the left-hand folder tree), falling back to a general "selected
+    # folder" query, then to DEFAULT_CONTENT_PATH if nothing is highlighted.
+    for getter in (
+        "get_selected_path_view_folder_paths",
+        "get_selected_folder_paths",
+    ):
+        try:
+            paths = getattr(unreal.EditorUtilityLibrary, getter)()
+        except Exception:
+            paths = None
+        if paths:
+            unreal.log(f"BB Unreal Export: importing into highlighted Content Browser folder '{paths[0]}'")
+            return paths[0]
+    unreal.log(f"BB Unreal Export: no folder highlighted in Content Browser, using default '{DEFAULT_CONTENT_PATH}'")
+    return DEFAULT_CONTENT_PATH
+
+
+# BB_JSON_PATH / BB_CREATE_LEVEL_INSTANCE / BB_IMPORT_MATERIALS / BB_CONTENT_PATH
+# are injected into globals() by the Tools menu entry (file picker + option
+# checkboxes); fall back to the defaults above for manual runs pasted
+# straight into the console.
 JSON_PATH = globals().get("BB_JSON_PATH") or DEFAULT_JSON_PATH
 FBX_DIR = os.path.dirname(JSON_PATH)         # exported .fbx files sit next to the JSON
 CREATE_LEVEL_INSTANCE = globals().get("BB_CREATE_LEVEL_INSTANCE", DEFAULT_CREATE_LEVEL_INSTANCE)
+IMPORT_MATERIALS = globals().get("BB_IMPORT_MATERIALS", DEFAULT_IMPORT_MATERIALS)
+CONTENT_PATH = globals().get("BB_CONTENT_PATH") or _resolve_content_path()
 
 
 def blender_to_unreal_location(loc_m):
@@ -63,12 +87,14 @@ def import_fbx(fbx_path, destination_path, asset_name):
     options.import_mesh = True
     options.import_as_skeletal = False
     options.import_animations = False
-    options.import_materials = True
-    options.import_textures = True
+    options.import_materials = IMPORT_MATERIALS
+    options.import_textures = IMPORT_MATERIALS
     options.static_mesh_import_data.combine_meshes = False
     options.static_mesh_import_data.import_translation = unreal.Vector(0.0, 0.0, 0.0)
     options.static_mesh_import_data.import_rotation = unreal.Rotator(0.0, 0.0, 0.0)
     options.static_mesh_import_data.import_uniform_scale = 1.0
+    # Use the normals authored in the FBX instead of Unreal recomputing them.
+    options.static_mesh_import_data.normal_import_method = unreal.FBXNormalImportMethod.FBXNIM_IMPORT_NORMALS
 
     task = unreal.AssetImportTask()
     task.filename = fbx_path
