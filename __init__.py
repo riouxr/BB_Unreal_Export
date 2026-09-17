@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 7, 1),
+    "version": (1, 7, 3),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -455,8 +455,17 @@ def _material_texture_info(mat, warnings):
 
     emissive_img = _upstream_image(bsdf.inputs.get('Emission Color') or bsdf.inputs.get('Emission'))
 
+    # The BSDF's plain Base Color value -- always present (it's a Color
+    # socket's default_value), regardless of whether a texture is plugged
+    # in. Recorded so a material with no Base Color texture still shows its
+    # real flat color in Unreal (as Base_Color_Tint) instead of either
+    # nothing or MM_Standard_01's own checker-pattern debug placeholder.
+    base_color_socket = bsdf.inputs.get('Base Color')
+    base_color_value = list(base_color_socket.default_value) if base_color_socket else [0.8, 0.8, 0.8, 1.0]
+
     return {
         "base_color": resolve("base_color", base_color_img),
+        "base_color_value": base_color_value,
         "orm": resolve("orm", orm_img),
         "normal": resolve("normal", normal_img),
         "emissive": resolve("emissive", emissive_img),

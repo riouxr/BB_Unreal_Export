@@ -22,6 +22,9 @@ import unreal
 import json
 import os
 import re
+import struct
+import zlib
+import tempfile
 
 # ---- USER SETTINGS -------------------------------------------------------
 DEFAULT_JSON_PATH = r"E:\Epic\UDS_barcelona\bb_unreal_export_transforms.json"
@@ -513,13 +516,50 @@ def _import_loose_texture(file_path, destination_path, asset_name):
     return None
 
 
-def _find_instance_for_base_color(base_color_tex):
-    # Dedup by the actual Base_Color texture rather than a separate mapping
-    # file -- reruns then reuse the same MI_Standard_NN instead of piling up
-    # duplicates, without needing any bookkeeping to survive between runs.
-    # Scoped to this collection's own INSTANCE_DEST_PATH, not shared globally
-    # like the master material -- each collection gets its own MI_Standard_NN
-    # numbering and instances.
+def _write_1x1_white_png(path):
+    # A minimal, hand-built 1x1 opaque-white RGBA PNG -- avoids depending on
+    # any built-in Unreal engine texture asset path, since guessing those has
+    # already been wrong twice this session (the placeholder default
+    # textures from the original MM_Standard.txt export don't exist in a
+    # fresh project). This has no dependency on anything but stdlib.
+    width, height = 1, 1
+    raw = b"\xff\xff\xff\xff"  # one RGBA pixel, opaque white
+    scanline = b"\x00" + raw  # filter type 0 (None) + pixel data
+    compressed = zlib.compress(scanline, 9)
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)  # 8-bit RGBA (color type 6)
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", compressed) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def _ensure_flat_white_texture():
+    # Shared across every collection (like MM_Standard_01 itself) -- used as
+    # the Base_Color texture for materials with no Base Color image, so
+    # Base_Color_Tint alone determines the visible flat color instead of
+    # tinting MM_Standard_01's checker-pattern debug default.
+    asset_path = f"{MATERIAL_DEST_PATH}/T_BB_Flat_White"
+    if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        return unreal.EditorAssetLibrary.load_asset(asset_path)
+    tmp_path = os.path.join(tempfile.gettempdir(), "bb_unreal_export_flat_white.png")
+    _write_1x1_white_png(tmp_path)
+    return _import_loose_texture(tmp_path, MATERIAL_DEST_PATH, "T_BB_Flat_White")
+
+
+def _colors_match(a, b, epsilon=0.001):
+    return all(abs(a.get_editor_property(c) - b[i]) < epsilon for i, c in enumerate(("r", "g", "b", "a")))
+
+
+def _find_instance_for_base_color(base_color_tex, base_color_tint):
+    # Dedup by the actual Base_Color texture and tint rather than a separate
+    # mapping file -- reruns then reuse the same MI_Standard_NN instead of
+    # piling up duplicates, without needing any bookkeeping to survive
+    # between runs. Scoped to this collection's own INSTANCE_DEST_PATH, not
+    # shared globally like the master material -- each collection gets its
+    # own MI_Standard_NN numbering and instances.
     if base_color_tex is None or not unreal.EditorAssetLibrary.does_directory_exist(INSTANCE_DEST_PATH):
         return None
     prefix = f"{INSTANCE_DEST_PATH}/MI_Standard_"
@@ -530,7 +570,10 @@ def _find_instance_for_base_color(base_color_tex):
         if instance is None:
             continue
         existing_tex = unreal.MaterialEditingLibrary.get_material_instance_texture_parameter_value(instance, "Base_Color")
-        if existing_tex == base_color_tex:
+        if existing_tex != base_color_tex:
+            continue
+        existing_tint = unreal.MaterialEditingLibrary.get_material_instance_vector_parameter_value(instance, "Base_Color_Tint")
+        if _colors_match(existing_tint, base_color_tint):
             return instance
     return None
 
@@ -546,8 +589,8 @@ def _next_instance_name():
     return f"{prefix}{highest + 1:02d}"
 
 
-def _ensure_material_instance(master, base_color_tex, normal_tex, emissive_tex, orm_tex):
-    existing = _find_instance_for_base_color(base_color_tex)
+def _ensure_material_instance(master, base_color_tex, base_color_tint, normal_tex, emissive_tex, orm_tex):
+    existing = _find_instance_for_base_color(base_color_tex, base_color_tint)
     if existing is not None:
         return existing
 
@@ -566,6 +609,8 @@ def _ensure_material_instance(master, base_color_tex, normal_tex, emissive_tex, 
     MEL.set_material_instance_parent(instance, master)
     if base_color_tex is not None:
         MEL.set_material_instance_texture_parameter_value(instance, "Base_Color", base_color_tex)
+    r, g, b, a = base_color_tint
+    MEL.set_material_instance_vector_parameter_value(instance, "Base_Color_Tint", unreal.LinearColor(r, g, b, a))
     if normal_tex is not None:
         MEL.set_material_instance_texture_parameter_value(instance, "Normal", normal_tex)
     if emissive_tex is not None:
@@ -626,8 +671,19 @@ def _apply_materials(static_mesh, material_names, materials_data):
         normal_tex = _load_texture_for_slot(info.get("normal"))
         emissive_tex = _load_texture_for_slot(info.get("emissive"))
         orm_tex = _load_texture_for_slot(info.get("orm"))
+        base_color_tint = info.get("base_color_value") or [0.8, 0.8, 0.8, 1.0]
 
-        instance = _ensure_material_instance(master, base_color_tex, normal_tex, emissive_tex, orm_tex)
+        if base_color_tex is None:
+            # No Base Color image -- fall back to a flat white texture so
+            # Base_Color_Tint (the BSDF's plain Base Color value, always
+            # recorded) determines the visible flat color, instead of either
+            # nothing or MM_Standard_01's own checker-pattern debug default.
+            try:
+                base_color_tex = _ensure_flat_white_texture()
+            except Exception as exc:
+                unreal.log_error(f"BB Unreal Export: could not create the flat-white fallback texture ({exc}); '{mat_name}' will show MM_Standard_01's checker default")
+
+        instance = _ensure_material_instance(master, base_color_tex, base_color_tint, normal_tex, emissive_tex, orm_tex)
         if instance is not None:
             # set_editor_property("static_materials", ...) on the raw struct
             # array is documented as unreliable for actually applying/

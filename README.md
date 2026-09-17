@@ -192,6 +192,15 @@ missing textures) and instead rebuilds materials straight from the JSON's
   position; a mismatch (or a material with no recorded info, e.g. one that
   wasn't a plain Principled BSDF hookup in Blender) is logged and that slot
   is left as-is rather than guessed at.
+- **Base Color always gets set, texture or not.** The material info also
+  records the BSDF's plain Base Color value (its Color socket's
+  `default_value`, always present regardless of whether an image is plugged
+  in) and sets it as `Base_Color_Tint` on the instance. If there's no Base
+  Color image, the instance's `Base_Color` texture is set to a generated
+  flat white 1x1 PNG (built once per project, `T_BB_Flat_White`, next to
+  `MM_Standard_01`) instead of being left unset -- so `Base_Color_Tint`
+  alone determines the visible flat color, rather than tinting
+  `MM_Standard_01`'s own checker-pattern debug default or showing nothing.
 - `Detail_Normal` and everything else on MM_Standard_01 has no Blender-side
   source at all and stays at its default.
 
