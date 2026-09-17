@@ -73,7 +73,7 @@ def _run_prompt_flow(initial_dir, default_create_level_instance, default_import_
             dialog, text="Group spawned actors into a Level Instance", variable=level_instance_var
         ).pack(padx=16, pady=4, anchor="w")
         tk.Checkbutton(
-            dialog, text="Import materials", variable=materials_var
+            dialog, text="Import materials (rebuild against MM_Standard_01)", variable=materials_var
         ).pack(padx=16, pady=4, anchor="w")
 
         button_frame = tk.Frame(dialog)

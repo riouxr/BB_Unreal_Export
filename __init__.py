@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 5, 1),
+    "version": (1, 7, 1),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -29,6 +29,7 @@ import bpy
 import os
 import re
 import json
+import shutil
 from mathutils import Matrix
 
 
@@ -177,6 +178,7 @@ def _write_transforms_json(objects, filepath):
     entries = []
     for obj in objects:
         loc, rot, scale = obj.matrix_world.decompose()
+        materials = [slot.material.name for slot in obj.material_slots if slot.material] if obj.type == 'MESH' else []
         entries.append({
             "name": obj.name,
             "source_fbx": _source_fbx_name(obj),
@@ -184,20 +186,23 @@ def _write_transforms_json(objects, filepath):
             "rotation_quat_wxyz": [rot.w, rot.x, rot.y, rot.z],
             "scale": [scale.x, scale.y, scale.z],
             "parent": obj.parent.name if obj.parent else None,
+            "materials": materials,
         })
 
+    material_info, material_warnings = _collect_material_info(objects)
     data = {
         "unit": "meters",
         "up_axis": "Z",
         "forward_axis": "-Y",
         "handedness": "right",
+        "materials": material_info,
         "objects": entries,
     }
 
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2)
 
-    return len(entries)
+    return len(entries), material_warnings
 
 
 class BBUNREALEXPORT_OT_export_fbx(bpy.types.Operator):
@@ -274,6 +279,7 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
             return {'CANCELLED'}
 
         total_entries = 0
+        all_warnings = []
         touched = 0
         for subfolder, objects in targets:
             if not objects:
@@ -282,18 +288,245 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
             target_dir = os.path.join(directory, _sanitize_filename(subfolder)) if subfolder else directory
             os.makedirs(target_dir, exist_ok=True)
             json_name = _json_filename(context, subfolder)
-            total_entries += _write_transforms_json(objects, os.path.join(target_dir, json_name))
+            entries, warnings = _write_transforms_json(objects, os.path.join(target_dir, json_name))
+            total_entries += entries
+            all_warnings.extend(warnings)
 
         if context.scene.bb_unreal_export_per_collection:
             if touched == 0:
                 self.report({'WARNING'}, "Selected collection(s) have no objects")
                 return {'CANCELLED'}
-            self.report({'INFO'}, f"Wrote {total_entries} transform(s) across {touched} collection(s)")
+            message = f"Wrote {total_entries} transform(s) across {touched} collection(s)"
         else:
             if touched == 0:
                 self.report({'WARNING'}, "No objects selected")
                 return {'CANCELLED'}
-            self.report({'INFO'}, f"Wrote {total_entries} transform(s) to {directory}")
+            message = f"Wrote {total_entries} transform(s) to {directory}"
+
+        if all_warnings:
+            self.report({'WARNING'}, message + "; " + "; ".join(all_warnings[:5]) + ("..." if len(all_warnings) > 5 else ""))
+        else:
+            self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+
+def _collect_images_from_objects(objects):
+    images = []
+    seen = set()
+    for obj in objects:
+        if obj.type != 'MESH' or obj.data is None:
+            continue
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is None or mat.node_tree is None:
+                continue
+            for node in mat.node_tree.nodes:
+                if node.type == 'TEX_IMAGE' and node.image is not None and node.image.name not in seen:
+                    seen.add(node.image.name)
+                    images.append(node.image)
+    return images
+
+
+def _texture_source_path(image):
+    return bpy.path.abspath(image.filepath_raw or image.filepath) if image else None
+
+
+def _texture_dest_filename(image):
+    # The filename Collect Textures copies this image to -- shared with the
+    # material-info writer below so a JSON "base_color"/"orm"/etc. entry
+    # always matches the actual file on disk byte for byte.
+    #
+    # Requires a real file, not just a non-empty path: an Image Texture node
+    # whose filepath is broken/incomplete in the .blend (e.g. pointing at a
+    # folder, like a UDIM-named image left with just "//Textures" instead of
+    # a real per-tile filename) would otherwise silently resolve to that
+    # folder's own name as if it were a texture filename -- a name that
+    # looks plausible enough to not get noticed, instead of the obviously
+    # wrong result it actually is.
+    src = _texture_source_path(image)
+    if not src or not os.path.isfile(src):
+        return None
+    ext = os.path.splitext(src)[1]
+    return _sanitize_filename(os.path.splitext(os.path.basename(src))[0]) + ext
+
+
+def _copy_textures(objects, textures_dir):
+    images = _collect_images_from_objects(objects)
+    if not images:
+        return 0, []
+
+    os.makedirs(textures_dir, exist_ok=True)
+    copied = 0
+    missing = []
+    for image in images:
+        src = _texture_source_path(image)
+        if not src or not os.path.isfile(src):
+            missing.append(image.name)
+            continue
+        dst = os.path.join(textures_dir, _texture_dest_filename(image))
+        if os.path.abspath(src) != os.path.abspath(dst):
+            shutil.copyfile(src, dst)
+        copied += 1
+    return copied, missing
+
+
+# ---- Material graph inspection --------------------------------------------
+# Reads each material's actual Principled BSDF node graph (instead of relying
+# on Unreal's own FBX Phong-material import, which uses an incompatible
+# non-PBR shading model and can't represent a packed ORM texture at all) so
+# the Unreal side can wire MM_Standard_01 directly from real data instead of
+# guessing from Phong instance parameters.
+
+_SEPARATE_COLOR_NODE_TYPES = {'SEPARATE_COLOR', 'SEPRGB'}
+
+
+def _upstream_image(socket, skip_separate_color=False, visited=None):
+    # Walk backward from a node input socket to the first Image Texture node
+    # reached, passing through ordinary utility nodes (Mapping, Multiply,
+    # Mix, ...) along the way. With skip_separate_color, a branch that goes
+    # through a Separate Color node is not descended into -- used when
+    # looking for the plain Base Color image so a packed ORM texture
+    # reached via Separate Color (e.g. an AO-channel multiply) isn't
+    # mistaken for it.
+    if visited is None:
+        visited = set()
+    if socket is None or not socket.is_linked:
+        return None
+    node = socket.links[0].from_node
+    if node in visited:
+        return None
+    visited.add(node)
+    if node.type == 'TEX_IMAGE':
+        return node.image
+    if skip_separate_color and node.type in _SEPARATE_COLOR_NODE_TYPES:
+        return None
+    for inp in node.inputs:
+        image = _upstream_image(inp, skip_separate_color, visited)
+        if image is not None:
+            return image
+    return None
+
+
+def _find_principled_bsdf(mat):
+    if mat is None or mat.node_tree is None:
+        return None
+    outputs = [n for n in mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL']
+    output = next((n for n in outputs if n.is_active_output), None) or (outputs[0] if outputs else None)
+    if output is None:
+        return None
+    surface = output.inputs.get('Surface')
+    if surface is None or not surface.is_linked:
+        return None
+    node = surface.links[0].from_node
+    return node if node.type == 'BSDF_PRINCIPLED' else None
+
+
+def _material_texture_info(mat, warnings):
+    # Returns None if this material isn't a plain Principled BSDF hookup (the
+    # only shape this reads); otherwise a dict of resolved dest filenames
+    # (matching _texture_dest_filename / what Collect Textures copies) per
+    # MM_Standard_01 slot, or None for any slot with nothing to report.
+    bsdf = _find_principled_bsdf(mat)
+    if bsdf is None:
+        return None
+
+    def resolve(role, image):
+        if image is None:
+            return None
+        filename = _texture_dest_filename(image)
+        if filename is None:
+            path = image.filepath_raw or image.filepath or "(no path set)"
+            warnings.append(f"'{mat.name}' {role}: image '{image.name}' has no usable file on disk (path: '{path}')")
+        return filename
+
+    base_color_img = _upstream_image(bsdf.inputs.get('Base Color'), skip_separate_color=True)
+
+    orm_img = None
+    for input_name in ('Metallic', 'Roughness'):
+        socket = bsdf.inputs.get(input_name)
+        if socket and socket.is_linked and socket.links[0].from_node.type in _SEPARATE_COLOR_NODE_TYPES:
+            orm_img = _upstream_image(socket.links[0].from_node.inputs[0])
+            break
+
+    normal_img = None
+    normal_socket = bsdf.inputs.get('Normal')
+    if normal_socket and normal_socket.is_linked and normal_socket.links[0].from_node.type == 'NORMAL_MAP':
+        normal_img = _upstream_image(normal_socket.links[0].from_node.inputs.get('Color'))
+
+    emissive_img = _upstream_image(bsdf.inputs.get('Emission Color') or bsdf.inputs.get('Emission'))
+
+    return {
+        "base_color": resolve("base_color", base_color_img),
+        "orm": resolve("orm", orm_img),
+        "normal": resolve("normal", normal_img),
+        "emissive": resolve("emissive", emissive_img),
+    }
+
+
+def _collect_material_info(objects):
+    materials = {}
+    warnings = []
+    for obj in objects:
+        if obj.type != 'MESH' or obj.data is None:
+            continue
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is None or mat.name in materials:
+                continue
+            info = _material_texture_info(mat, warnings)
+            if info is not None:
+                materials[mat.name] = info
+    return materials, warnings
+
+
+class BBUNREALEXPORT_OT_collect_textures(bpy.types.Operator):
+    bl_idname = "bb_unreal_export.collect_textures"
+    bl_label = "Collect Textures"
+    bl_description = (
+        "Copy every image texture used by the selected objects' materials "
+        "into a Textures subfolder next to the exported FBX (or, in Per "
+        "Collection mode, next to each collection's FBX), so the Unreal "
+        "rebuild script finds them without browsing for a folder"
+    )
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        directory = bpy.path.abspath(context.scene.bb_unreal_export_directory)
+        if not directory:
+            self.report({'WARNING'}, "Set an export directory first")
+            return {'CANCELLED'}
+
+        targets = _export_targets(context)
+        per_collection = context.scene.bb_unreal_export_per_collection
+        if per_collection and not targets:
+            self.report({'WARNING'}, "No collections selected in the Outliner")
+            return {'CANCELLED'}
+
+        total_copied = 0
+        all_missing = []
+        touched = 0
+        for subfolder, objects in targets:
+            if not objects:
+                continue
+            touched += 1
+            target_dir = os.path.join(directory, _sanitize_filename(subfolder)) if subfolder else directory
+            textures_dir = os.path.join(target_dir, "Textures")
+            copied, missing = _copy_textures(objects, textures_dir)
+            total_copied += copied
+            all_missing.extend(missing)
+
+        if touched == 0:
+            self.report({'WARNING'}, "Selected collection(s) have no objects" if per_collection else "No objects selected")
+            return {'CANCELLED'}
+
+        message = f"Copied {total_copied} texture(s)"
+        if per_collection:
+            message += f" across {touched} collection(s)"
+        if all_missing:
+            names = ", ".join(all_missing[:5]) + ("..." if len(all_missing) > 5 else "")
+            self.report({'WARNING'}, f"{message}, {len(all_missing)} skipped (no source file on disk, e.g. packed/generated): {names}")
+        else:
+            self.report({'INFO'}, message)
         return {'FINISHED'}
 
 
@@ -301,10 +534,11 @@ class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
     bl_idname = "bb_unreal_export.export_all"
     bl_label = "Export All"
     bl_description = (
-        "Export FBX files and write the transforms JSON in one click. Reads the "
-        "current selection (or Outliner collection selection, if Per Collection "
-        "is on) once, so the two outputs can never end up out of sync with each "
-        "other from selection changing between separate clicks"
+        "Export FBX files, write the transforms JSON, and collect textures "
+        "in one click. Reads the current selection (or Outliner collection "
+        "selection, if Per Collection is on) once, so the outputs can never "
+        "end up out of sync with each other from selection changing between "
+        "separate clicks"
     )
     bl_options = {'REGISTER'}
 
@@ -328,6 +562,9 @@ class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
 
         total_exported = 0
         total_entries = 0
+        total_copied = 0
+        all_missing = []
+        all_warnings = []
         touched = 0
         for subfolder, objects in targets:
             if not objects:
@@ -337,7 +574,12 @@ class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
             os.makedirs(target_dir, exist_ok=True)
             total_exported += _export_objects_to_fbx(context, objects, target_dir)
             json_name = _json_filename(context, subfolder)
-            total_entries += _write_transforms_json(objects, os.path.join(target_dir, json_name))
+            entries, warnings = _write_transforms_json(objects, os.path.join(target_dir, json_name))
+            total_entries += entries
+            all_warnings.extend(warnings)
+            copied, missing = _copy_textures(objects, os.path.join(target_dir, "Textures"))
+            total_copied += copied
+            all_missing.extend(missing)
 
         bpy.ops.object.select_all(action='DESELECT')
         for obj in original_selected:
@@ -349,13 +591,25 @@ class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
             self.report({'WARNING'}, "Selected collection(s) have no objects" if per_collection else "No objects selected")
             return {'CANCELLED'}
 
+        message = f"Exported {total_exported} FBX file(s), {total_entries} transform(s) and {total_copied} texture(s)"
         if per_collection:
-            self.report(
-                {'INFO'},
-                f"Exported {total_exported} FBX file(s) and {total_entries} transform(s) across {touched} collection(s)",
-            )
+            message += f" across {touched} collection(s)"
         else:
-            self.report({'INFO'}, f"Exported {total_exported} FBX file(s) and {total_entries} transform(s) to {directory}")
+            message += f" to {directory}"
+
+        problems = []
+        if all_missing:
+            names = ", ".join(all_missing[:5]) + ("..." if len(all_missing) > 5 else "")
+            problems.append(f"{len(all_missing)} texture(s) skipped (no source file on disk): {names}")
+        if all_warnings:
+            problems.extend(all_warnings[:5])
+            if len(all_warnings) > 5:
+                problems.append("...")
+
+        if problems:
+            self.report({'WARNING'}, f"{message}; " + "; ".join(problems))
+        else:
+            self.report({'INFO'}, message)
         return {'FINISHED'}
 
 
@@ -481,11 +735,14 @@ class BBUNREALEXPORT_PT_panel(bpy.types.Panel):
         col2.operator("bb_unreal_export.export_fbx", text="Export FBX Only", icon='EXPORT')
         col2.operator("bb_unreal_export.export_transforms", text="Export Geo Transforms Only", icon='FILE')
 
+        layout.operator("bb_unreal_export.collect_textures", text="Collect Textures", icon='TEXTURE')
+
 
 classes = (
     BBUNREALEXPORT_OT_export_fbx,
     BBUNREALEXPORT_OT_export_transforms,
     BBUNREALEXPORT_OT_export_all,
+    BBUNREALEXPORT_OT_collect_textures,
     BBUNREALEXPORT_OT_cleanup,
     BBUNREALEXPORT_PT_panel,
 )

@@ -55,6 +55,46 @@ Blender's own duplicate naming turns `foo_01` into `foo_01.001`,
 the original's zero-padded numeric style instead — `foo_01`, `foo_02`,
 `foo_03`, ...
 
+### Collect Textures
+
+Copies every image texture used by the selected objects' materials (walking
+each material's node tree for `TEX_IMAGE` nodes) into a `Textures` subfolder
+next to the exported FBX — `Textures/` alongside a plain export, or
+`Wall/Textures/` etc. per collection in Per Collection mode. This is what
+lets the Unreal side find every texture (including a packed ORM one, see
+below) without ever being pointed at a folder: it just looks next to the
+JSON. Images with no file on disk (packed into the .blend, or
+generated/procedural) are skipped and reported by name.
+
+### Material info in the transforms JSON
+
+**Export Geo Transforms** (and **Export All**) also reads each selected
+object's materials and records, per Blender material, which texture plays
+which role — read directly from the material's actual Principled BSDF node
+graph, not guessed from a filename:
+
+- **Base Color** — walks back from the BSDF's Base Color input to the first
+  Image Texture found; if that input is a Multiply/Mix (e.g. diffuse × an AO
+  channel split out of a packed ORM texture), it skips any branch that goes
+  through a Separate Color node so the packed texture isn't mistaken for the
+  plain base color image.
+- **ORM** — if Metallic or Roughness is fed by a Separate Color node, the
+  image feeding that Separate Color is recorded as the packed ORM texture
+  (R=AO, G=Roughness, B=Metallic, matching how `MM_Standard_01`'s own ORM
+  parameter is wired in Unreal).
+- **Normal** — the image feeding a Normal Map node feeding the BSDF's Normal
+  input.
+- **Emissive** — the image feeding the BSDF's Emission Color input, if any.
+
+A material with no Principled BSDF hookup at all (e.g. plain Diffuse BSDF)
+is skipped entirely and reported as such by the Unreal side at rebuild time,
+rather than guessed at.
+
+Each object's JSON entry also records its material slots in order
+(`"materials": ["MatA", "MatB", ...]`), so the Unreal side can match them
+positionally against the imported mesh's own material slots (FBX import
+preserves slot order).
+
 ## Unreal side: `unreal_rebuild_scene.py`
 
 ### One-time setup: a Tools menu entry (recommended)
@@ -87,12 +127,28 @@ Edit the top of the script first:
 
 - `DEFAULT_JSON_PATH` — path to the transforms JSON (overridden automatically
   when run via the Tools menu's file picker)
-- `CONTENT_PATH` — content-browser folder the static meshes import into
+- `CONTENT_PATH` — content-browser folder everything below is organized
+  under (see **Content organization** below)
 - `DEFAULT_CREATE_LEVEL_INSTANCE` — see below (overridden by the Tools menu
   checkbox)
 
 `FBX_DIR` is always the JSON's own folder — the exported FBX files must sit
 next to it.
+
+### Content organization
+
+The JSON is named after its Blender collection in Per Collection mode (e.g.
+`Wall.json` -> `Wall`), reused here as `COLLECTION_LABEL` to keep each
+collection's rebuilt output separate under `CONTENT_PATH`:
+
+- `CONTENT_PATH/<COLLECTION_LABEL>_Mesh` — imported Static Meshes
+- `CONTENT_PATH/<COLLECTION_LABEL>_Material` — this collection's
+  `MI_Standard_NN` instances (numbered independently per collection)
+- `CONTENT_PATH/<COLLECTION_LABEL>_Textures` — this collection's imported
+  Base Color/Normal/ORM/Emissive `Texture2D` assets
+- `CONTENT_PATH/Materials` — **not** per-collection: `MM_Standard_01` is
+  shared project-wide (see `_find_master_material_anywhere`), so it always
+  lives here regardless of which collection triggered building it
 
 For each JSON entry the script imports the source FBX once per unique mesh
 (skips re-importing if the asset already exists at that path), then spawns a
@@ -110,6 +166,34 @@ spawned actors into it, then spawn a `LevelInstance` actor at the world
 origin pointing at that asset. If any step fails, it automatically falls back
 to just selecting the spawned actors so you can finish with one right-click
 (Outliner/Viewport > right-click > Level > Create Level Instance).
+
+### Material reconnection
+
+When **Import materials** is on, `import_fbx` skips Unreal's own FBX
+material/texture import entirely (it only understands a non-PBR Phong
+material with no packed-ORM concept, and was a perpetual source of wrong or
+missing textures) and instead rebuilds materials straight from the JSON's
+`"materials"` dict:
+
+- If `MM_Standard_01` doesn't already exist under `CONTENT_PATH/Materials`,
+  it's built from scratch (see the long comment above `_build_master_material`
+  in `unreal_rebuild_scene.py` for how, and its two known limitations: Blend
+  Mode/Shading Model/Two Sided can't be recovered from the source export and
+  default to Unreal's normal new-Material values, and one class of wiring
+  -- function-call input pin names -- is a best guess that couldn't be
+  tested live).
+- For each Blender material referenced by an object's material slots, a
+  `MI_Standard_NN` instance is created (or reused, deduped by its Base_Color
+  texture, if a matching one already exists) with `Base_Color`/`Normal`/
+  `ORM`/`Emissive` set from the JSON's recorded filenames, imported from
+  `TEXTURES_DIR` (`FBX_DIR/Textures`, populated by Blender's **Collect
+  Textures** button -- see above).
+- A mesh's material slot count and the JSON's material list are matched by
+  position; a mismatch (or a material with no recorded info, e.g. one that
+  wasn't a plain Principled BSDF hookup in Blender) is logged and that slot
+  is left as-is rather than guessed at.
+- `Detail_Normal` and everything else on MM_Standard_01 has no Blender-side
+  source at all and stays at its default.
 
 ### Coordinate conversion
 
