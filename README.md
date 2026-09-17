@@ -143,7 +143,7 @@ collection's rebuilt output separate under `CONTENT_PATH`:
 
 - `CONTENT_PATH/<COLLECTION_LABEL>_Mesh` — imported Static Meshes
 - `CONTENT_PATH/<COLLECTION_LABEL>_Material` — this collection's
-  `MI_Standard_NN` instances (numbered independently per collection)
+  `MI_<BlenderMaterialName>_01` instances, one per unique Blender material
 - `CONTENT_PATH/<COLLECTION_LABEL>_Textures` — this collection's imported
   Base Color/Normal/ORM/Emissive `Texture2D` assets
 - `CONTENT_PATH/Materials` — **not** per-collection: `MM_Standard_01` is
@@ -182,12 +182,17 @@ missing textures) and instead rebuilds materials straight from the JSON's
   default to Unreal's normal new-Material values, and one class of wiring
   -- function-call input pin names -- is a best guess that couldn't be
   tested live).
-- For each Blender material referenced by an object's material slots, a
-  `MI_Standard_NN` instance is created (or reused, deduped by its Base_Color
-  texture, if a matching one already exists) with `Base_Color`/`Normal`/
-  `ORM`/`Emissive` set from the JSON's recorded filenames, imported from
-  `TEXTURES_DIR` (`FBX_DIR/Textures`, populated by Blender's **Collect
-  Textures** button -- see above).
+- For each unique Blender material referenced by an object's material
+  slots, an instance named `MI_<BlenderMaterialName>_01` is created once and
+  reused for every part that uses it (matching how the old native FBX
+  material import worked -- one asset per material, shared across parts)
+  with `Base_Color`/`Normal`/`ORM`/`Emissive` set from the JSON's recorded
+  filenames, imported from `TEXTURES_DIR` (`FBX_DIR/Textures`, populated by
+  Blender's **Collect Textures** button -- see above). Dedup is purely by
+  name, not by comparing resolved textures, so once an instance exists it's
+  never overwritten on a later run -- delete `MI_<name>_01` by hand first if
+  you want a rerun to pick up a material change from Blender (same as
+  `MM_Standard_01`).
 - A mesh's material slot count and the JSON's material list are matched by
   position; a mismatch (or a material with no recorded info, e.g. one that
   wasn't a plain Principled BSDF hookup in Blender) is logged and that slot

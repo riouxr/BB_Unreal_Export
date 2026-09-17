@@ -549,52 +549,28 @@ def _ensure_flat_white_texture():
     return _import_loose_texture(tmp_path, MATERIAL_DEST_PATH, "T_BB_Flat_White")
 
 
-def _colors_match(a, b, epsilon=0.001):
-    return all(abs(a.get_editor_property(c) - b[i]) < epsilon for i, c in enumerate(("r", "g", "b", "a")))
+def _instance_asset_name(mat_name):
+    return f"MI_{_sanitize_asset_name(mat_name)}_01"
 
 
-def _find_instance_for_base_color(base_color_tex, base_color_tint):
-    # Dedup by the actual Base_Color texture and tint rather than a separate
-    # mapping file -- reruns then reuse the same MI_Standard_NN instead of
-    # piling up duplicates, without needing any bookkeeping to survive
-    # between runs. Scoped to this collection's own INSTANCE_DEST_PATH, not
-    # shared globally like the master material -- each collection gets its
-    # own MI_Standard_NN numbering and instances.
-    if base_color_tex is None or not unreal.EditorAssetLibrary.does_directory_exist(INSTANCE_DEST_PATH):
-        return None
-    prefix = f"{INSTANCE_DEST_PATH}/MI_Standard_"
-    for asset_path in unreal.EditorAssetLibrary.list_assets(INSTANCE_DEST_PATH, recursive=False):
-        if not asset_path.startswith(prefix):
-            continue
-        instance = unreal.EditorAssetLibrary.load_asset(asset_path)
-        if instance is None:
-            continue
-        existing_tex = unreal.MaterialEditingLibrary.get_material_instance_texture_parameter_value(instance, "Base_Color")
-        if existing_tex != base_color_tex:
-            continue
-        existing_tint = unreal.MaterialEditingLibrary.get_material_instance_vector_parameter_value(instance, "Base_Color_Tint")
-        if _colors_match(existing_tint, base_color_tint):
-            return instance
-    return None
+def _ensure_material_instance(master, mat_name, base_color_tex, base_color_tint, normal_tex, emissive_tex, orm_tex):
+    # Dedup by the Blender material's own name, not by comparing resolved
+    # textures/tint -- matching how the old native FBX material import
+    # worked (one asset per unique material name, reused across every part
+    # that references it), and reusing the exact same does_asset_exist ->
+    # load_asset pattern already proven reliable elsewhere in this script
+    # for meshes and loose textures, rather than trusting Python `==`
+    # equality between two Texture2D object wrappers (never verified to
+    # actually mean "same underlying asset" in this engine's bindings).
+    # Once created, an instance is never overwritten on a later run -- if
+    # you edit the material's color in Blender, delete the existing
+    # MI_<name>_01 asset before re-running to pick up the change, same as
+    # MM_Standard_01.
+    name = _instance_asset_name(mat_name)
+    asset_path = f"{INSTANCE_DEST_PATH}/{name}"
+    if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        return unreal.EditorAssetLibrary.load_asset(asset_path)
 
-
-def _next_instance_name():
-    prefix = "MI_Standard_"
-    highest = 0
-    if unreal.EditorAssetLibrary.does_directory_exist(INSTANCE_DEST_PATH):
-        for asset_path in unreal.EditorAssetLibrary.list_assets(INSTANCE_DEST_PATH, recursive=False):
-            name = asset_path.rsplit("/", 1)[-1].split(".")[0]
-            if name.startswith(prefix) and name[len(prefix):].isdigit():
-                highest = max(highest, int(name[len(prefix):]))
-    return f"{prefix}{highest + 1:02d}"
-
-
-def _ensure_material_instance(master, base_color_tex, base_color_tint, normal_tex, emissive_tex, orm_tex):
-    existing = _find_instance_for_base_color(base_color_tex, base_color_tint)
-    if existing is not None:
-        return existing
-
-    name = _next_instance_name()
     factory = unreal.MaterialInstanceConstantFactoryNew()
     instance = unreal.AssetToolsHelpers.get_asset_tools().create_asset(name, INSTANCE_DEST_PATH, unreal.MaterialInstanceConstant, factory)
     if instance is None:
@@ -683,7 +659,7 @@ def _apply_materials(static_mesh, material_names, materials_data):
             except Exception as exc:
                 unreal.log_error(f"BB Unreal Export: could not create the flat-white fallback texture ({exc}); '{mat_name}' will show MM_Standard_01's checker default")
 
-        instance = _ensure_material_instance(master, base_color_tex, base_color_tint, normal_tex, emissive_tex, orm_tex)
+        instance = _ensure_material_instance(master, mat_name, base_color_tex, base_color_tint, normal_tex, emissive_tex, orm_tex)
         if instance is not None:
             # set_editor_property("static_materials", ...) on the raw struct
             # array is documented as unreliable for actually applying/
