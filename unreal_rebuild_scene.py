@@ -129,12 +129,35 @@ def import_fbx(fbx_path, destination_path, asset_name):
     return None
 
 
+def _cleanup_stale_object_actors(names):
+    # A run that hits the missing-parts retry limit (see
+    # group_actors_into_level_instance) leaves some freshly spawned
+    # StaticMeshActors behind directly in the persistent level -- never moved
+    # into a Level Instance, never cleaned up. Re-running then spawns a brand
+    # new actor with the same label for every entry, so those old stragglers
+    # and the new ones end up sharing labels; _actors_by_label can no longer
+    # tell them apart, which silently corrupts which actors get moved. Clear
+    # out anything from a previous run before spawning fresh ones.
+    actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    name_set = set(names)
+    stale = [
+        a for a in actor_subsystem.get_all_level_actors()
+        if type(a) == unreal.StaticMeshActor and a.get_actor_label() in name_set
+    ]
+    for a in stale:
+        actor_subsystem.destroy_actor(a)
+    if stale:
+        unreal.log(f"BB Unreal Export: removed {len(stale)} stale actor(s) left over from a previous run before rebuilding")
+
+
 def main():
     with open(JSON_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     objects = data["objects"]
     actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+
+    _cleanup_stale_object_actors([entry["name"] for entry in objects])
 
     mesh_cache = {}
     spawned_actors = []
@@ -218,17 +241,49 @@ def _actors_by_label(labels):
     return [a for a in actor_subsystem.get_all_level_actors() if a.get_actor_label() in label_set]
 
 
+def _find_existing_level_instance_actor(label):
+    actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    for a in actor_subsystem.get_all_level_actors():
+        if isinstance(a, unreal.LevelInstance) and a.get_actor_label() == label:
+            return a
+    return None
+
+
+def _next_free_level_path(label):
+    # Deleting/recreating the same path in one script run is unreliable (see
+    # the long comment in _create_level_instance_from_actors below) -- so
+    # instead of ever colliding with a previous run's level asset, just pick
+    # a path that's free. This does mean old numbered level assets pile up
+    # under CONTENT_PATH/Levels/ across repeated rebuilds while iterating;
+    # that's an intentional tradeoff for correctness, clean them up by hand
+    # in the Content Browser once you're happy with a final result.
+    base = f"{CONTENT_PATH}/Levels/{label}"
+    if not unreal.EditorAssetLibrary.does_asset_exist(base):
+        return base
+    n = 2
+    while unreal.EditorAssetLibrary.does_asset_exist(f"{base}_{n}"):
+        n += 1
+    return f"{base}_{n}"
+
+
 def _create_level_instance_from_actors(actors, labels, persistent_level):
     label = os.path.splitext(os.path.basename(JSON_PATH))[0]
-    new_level_path = f"{CONTENT_PATH}/Levels/{label}"
 
-    if unreal.EditorAssetLibrary.does_asset_exist(new_level_path):
-        unreal.log_warning(
-            f"BB Unreal Export: level asset '{new_level_path}' already exists; "
-            "falling back to selecting the actors instead of overwriting it"
-        )
-        _select_actors_for_manual_level_instance(labels)
-        return
+    # Earlier versions of this script tried to delete the previous run's
+    # Level asset and respawn the LevelInstance actor from scratch. That's
+    # fundamentally unreliable: deleting an asset requires nothing still
+    # references it, but the LevelInstance actor that *was* referencing it
+    # only gets destroyed a few lines earlier in the same synchronous script
+    # run -- and Unreal doesn't release that reference until an actual engine
+    # tick/GC pass runs, which never happens mid-script (nothing ticks between
+    # Python statements in one exec() call). So the delete would silently
+    # fail every single time, not just sometimes, and the script fell back to
+    # "just select the actors" with no Level Instance created or updated at
+    # all. Fix: never delete anything. Always build the new sub-level at a
+    # fresh, never-colliding path, then either retarget an existing
+    # LevelInstance actor's world_asset to point at it, or spawn a new one if
+    # none exists yet. Nothing here depends on a destroy having "settled".
+    new_level_path = _next_free_level_path(label)
 
     streaming_level = unreal.EditorLevelUtils.create_new_streaming_level(
         unreal.LevelStreamingAlwaysLoaded, new_level_path, False
@@ -248,7 +303,8 @@ def _create_level_instance_from_actors(actors, labels, persistent_level):
     total = len(labels)
     moved_total = 0
     remaining_labels = set(labels)
-    for attempt in range(1, 4):
+    max_attempts = 8
+    for attempt in range(1, max_attempts + 1):
         if not to_move:
             break
         moved = unreal.EditorLevelUtils.move_actors_to_level(to_move, streaming_level, False, False)
@@ -259,7 +315,7 @@ def _create_level_instance_from_actors(actors, labels, persistent_level):
         remaining_labels = {a.get_actor_label() for a in still_in_persistent}
         to_move = still_in_persistent
         if to_move:
-            unreal.log(f"BB Unreal Export: retrying move for {len(to_move)} actor(s) (attempt {attempt})")
+            unreal.log(f"BB Unreal Export: retrying move for {len(to_move)} actor(s) (attempt {attempt}/{max_attempts})")
 
     unreal.log(f"BB Unreal Export: moved {total - len(remaining_labels)}/{total} actor(s) into '{new_level_path}'")
 
@@ -267,7 +323,10 @@ def _create_level_instance_from_actors(actors, labels, persistent_level):
         names = ", ".join(sorted(remaining_labels))
         unreal.log_warning(
             f"BB Unreal Export: {len(remaining_labels)} actor(s) were NOT moved into the "
-            f"Level Instance after 3 attempts and remain directly in the persistent level: {names}"
+            f"Level Instance after {max_attempts} attempts and remain directly in the persistent level: {names}. "
+            "These parts will look missing from the Level Instance even though their static mesh assets "
+            "imported fine -- re-run the rebuild (now safe to re-run, see above) to pick them up, or drag "
+            "them into the level instance by hand."
         )
         actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
         actor_subsystem.set_selected_level_actors(_actors_by_label(remaining_labels))
@@ -280,6 +339,18 @@ def _create_level_instance_from_actors(actors, labels, persistent_level):
         raise RuntimeError(f"could not load new level asset at '{new_level_path}' after creation")
 
     actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+
+    # Reuse a previous run's LevelInstance actor for this collection if one
+    # exists (just repoint it at the freshly built level) instead of
+    # destroying and respawning it -- keeps its position/rotation/any manual
+    # tweaks, and sidesteps the destroy-then-depend-on-it-immediately problem
+    # entirely, since nothing here is deleted.
+    instance_actor = _find_existing_level_instance_actor(label)
+    if instance_actor is not None:
+        instance_actor.set_editor_property("world_asset", level_world)
+        unreal.log(f"BB Unreal Export: updated existing Level Instance '{label}' to point at '{new_level_path}' ({total} actor(s))")
+        return
+
     instance_actor = actor_subsystem.spawn_actor_from_class(
         unreal.LevelInstance, unreal.Vector(0.0, 0.0, 0.0), unreal.Rotator(0.0, 0.0, 0.0)
     )
