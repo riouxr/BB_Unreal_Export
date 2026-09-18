@@ -360,8 +360,7 @@ def _build_master_material(material):
     _set_function(n['MaterialExpressionMaterialFunctionCall_3'], '/Engine/Functions/Engine_MaterialFunctions01/Texturing/FlattenNormal.FlattenNormal')
     n['MaterialExpressionTextureSampleParameter2D_6'].set_editor_property('parameter_name', 'ORM')
     n['MaterialExpressionTextureSampleParameter2D_6'].set_editor_property('group', 'ORM')
-    if _set_texture(n['MaterialExpressionTextureSampleParameter2D_6'], '/Game/Textures/Placeholder/T_Flat_ORM.T_Flat_ORM'):
-        n['MaterialExpressionTextureSampleParameter2D_6'].set_editor_property('sampler_type', unreal.MaterialSamplerType.SAMPLERTYPE_MASKS)
+    # Default texture + sampler type set by _fix_master_texture_defaults.
     n['MaterialExpressionTextureSampleParameter2D_0'].set_editor_property('parameter_name', 'Base_Color')
     n['MaterialExpressionTextureSampleParameter2D_0'].set_editor_property('group', 'Base_Color')
     _set_texture(n['MaterialExpressionTextureSampleParameter2D_0'], '/Engine/EditorMeshes/ColorCalibrator/Color_checker.Color_checker')
@@ -384,8 +383,7 @@ def _build_master_material(material):
     n['MaterialExpressionScalarParameter_6'].set_editor_property('group', 'Emissive')
     n['MaterialExpressionTextureSampleParameter2D_4'].set_editor_property('parameter_name', 'Normal')
     n['MaterialExpressionTextureSampleParameter2D_4'].set_editor_property('group', 'Normal')
-    if _set_texture(n['MaterialExpressionTextureSampleParameter2D_4'], '/Game/Textures/Placeholder/T_Placeholder_Normal.T_Placeholder_Normal'):
-        n['MaterialExpressionTextureSampleParameter2D_4'].set_editor_property('sampler_type', unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL)
+    # Default texture + sampler type set by _fix_master_texture_defaults.
     n['MaterialExpressionScalarParameter_7'].set_editor_property('parameter_name', 'Normal_Flatening')
     n['MaterialExpressionScalarParameter_7'].set_editor_property('group', 'Normal')
     n['MaterialExpressionStaticSwitchParameter_3'].set_editor_property('parameter_name', 'Use Color Mask')
@@ -408,8 +406,7 @@ def _build_master_material(material):
     n['MaterialExpressionScalarParameter_12'].set_editor_property('default_value', 1.0)
     n['MaterialExpressionTextureSampleParameter2D_3'].set_editor_property('parameter_name', 'Detail_Normal')
     n['MaterialExpressionTextureSampleParameter2D_3'].set_editor_property('group', 'Normal')
-    if _set_texture(n['MaterialExpressionTextureSampleParameter2D_3'], '/Game/Textures/Placeholder/T_Placeholder_Normal.T_Placeholder_Normal'):
-        n['MaterialExpressionTextureSampleParameter2D_3'].set_editor_property('sampler_type', unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL)
+    # Default texture + sampler type set by _fix_master_texture_defaults.
     n['MaterialExpressionScalarParameter_13'].set_editor_property('parameter_name', 'Detail Normal_tiling')
     n['MaterialExpressionScalarParameter_13'].set_editor_property('group', 'UV_Tiling')
     n['MaterialExpressionScalarParameter_13'].set_editor_property('default_value', 1.0)
@@ -419,7 +416,7 @@ def _build_master_material(material):
     _set_function(n['MaterialExpressionMaterialFunctionCall_4'], '/Engine/Functions/Engine_MaterialFunctions01/Texturing/FlattenNormal.FlattenNormal')
     n['MaterialExpressionTextureSampleParameter2D_5'].set_editor_property('parameter_name', 'Emissive')
     n['MaterialExpressionTextureSampleParameter2D_5'].set_editor_property('group', 'Emissive')
-    _set_texture(n['MaterialExpressionTextureSampleParameter2D_5'], '/Game/Textures/Placeholder/T_Placeholder_Black.T_Placeholder_Black')
+    # Default texture set by _fix_master_texture_defaults.
     n['MaterialExpressionVectorParameter_1'].set_editor_property('parameter_name', 'Emissive Color Tint')
     n['MaterialExpressionVectorParameter_1'].set_editor_property('group', 'Emissive')
     n['MaterialExpressionVectorParameter_1'].set_editor_property('default_value', unreal.LinearColor(0.0, 0.0, 0.0, 1.0))
@@ -515,15 +512,22 @@ def _find_master_material_anywhere():
 
 def _ensure_master_material():
     master_path = f"{MATERIAL_DEST_PATH}/{MASTER_MATERIAL_NAME}"
+    existing = None
     if unreal.EditorAssetLibrary.does_asset_exist(master_path):
-        return unreal.EditorAssetLibrary.load_asset(master_path)
-
-    existing = _find_master_material_anywhere()
+        existing = unreal.EditorAssetLibrary.load_asset(master_path)
+    else:
+        existing = _find_master_material_anywhere()
+        if existing is not None:
+            unreal.log(
+                f"BB Unreal Export: found existing {MASTER_MATERIAL_NAME} at "
+                f"'{existing.get_path_name()}', reusing it instead of building a new one"
+            )
     if existing is not None:
-        unreal.log(
-            f"BB Unreal Export: found existing {MASTER_MATERIAL_NAME} at "
-            f"'{existing.get_path_name()}', reusing it instead of building a new one"
-        )
+        # Masters built by earlier runs still have the engine checker as
+        # their ORM/Normal/Emissive defaults -- repair them in place.
+        if _fix_master_texture_defaults(existing):
+            unreal.MaterialEditingLibrary.recompile_material(existing)
+            unreal.EditorAssetLibrary.save_loaded_asset(existing)
         return existing
 
     unreal.log(f"BB Unreal Export: '{MASTER_MATERIAL_NAME}' not found anywhere in the project -- building it at '{master_path}'")
@@ -533,6 +537,7 @@ def _ensure_master_material():
         raise RuntimeError(f"could not create Material asset at '{master_path}'")
 
     _build_master_material(material)
+    _fix_master_texture_defaults(material)
 
     unreal.MaterialEditingLibrary.recompile_material(material)
 
@@ -585,16 +590,17 @@ def _import_loose_texture(file_path, destination_path, asset_name):
     return None
 
 
-def _write_1x1_white_png(path):
-    # A minimal, hand-built 1x1 opaque-white RGBA PNG -- avoids depending on
-    # any built-in Unreal engine texture asset path, since guessing those has
+def _write_flat_png(path, rgba):
+    # A minimal, hand-built solid-color RGBA PNG -- avoids depending on any
+    # built-in Unreal engine texture asset path, since guessing those has
     # already been wrong twice this session (the placeholder default
     # textures from the original MM_Standard.txt export don't exist in a
-    # fresh project). This has no dependency on anything but stdlib.
-    width, height = 1, 1
-    raw = b"\xff\xff\xff\xff"  # one RGBA pixel, opaque white
-    scanline = b"\x00" + raw  # filter type 0 (None) + pixel data
-    compressed = zlib.compress(scanline, 9)
+    # fresh project). This has no dependency on anything but stdlib. 4x4
+    # rather than 1x1 so block-compressed formats (BC5 for normal maps) get
+    # one whole block.
+    width, height = 4, 4
+    scanline = b"\x00" + bytes(rgba) * width  # filter type 0 (None) + pixel data
+    compressed = zlib.compress(scanline * height, 9)
 
     def chunk(tag, data):
         return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
@@ -605,17 +611,97 @@ def _write_1x1_white_png(path):
         f.write(png)
 
 
-def _ensure_flat_white_texture():
-    # Shared across every collection (like MM_Standard_01 itself) -- used as
-    # the Base_Color texture for materials with no Base Color image, so
-    # Base_Color_Tint alone determines the visible flat color instead of
-    # tinting MM_Standard_01's checker-pattern debug default.
-    asset_path = f"{MATERIAL_DEST_PATH}/T_BB_Flat_White"
+def _set_texture_settings(tex, compression, srgb):
+    # Saves only when something actually changes, so it's cheap to call on
+    # every run.
+    if tex.get_editor_property("compression_settings") == compression and tex.get_editor_property("srgb") == srgb:
+        return
+    tex.set_editor_property("compression_settings", compression)
+    tex.set_editor_property("srgb", srgb)
+    unreal.EditorAssetLibrary.save_loaded_asset(tex)
+
+
+def _ensure_flat_texture(asset_name, rgba, compression=None, srgb=True):
+    # Shared across every collection (like MM_Standard_01 itself).
+    asset_path = f"{MATERIAL_DEST_PATH}/{asset_name}"
     if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
         return unreal.EditorAssetLibrary.load_asset(asset_path)
-    tmp_path = os.path.join(tempfile.gettempdir(), "bb_unreal_export_flat_white.png")
-    _write_1x1_white_png(tmp_path)
-    return _import_loose_texture(tmp_path, MATERIAL_DEST_PATH, "T_BB_Flat_White")
+    tmp_path = os.path.join(tempfile.gettempdir(), f"bb_unreal_export_{asset_name}.png")
+    _write_flat_png(tmp_path, rgba)
+    tex = _import_loose_texture(tmp_path, MATERIAL_DEST_PATH, asset_name)
+    if tex is not None and compression is not None:
+        _set_texture_settings(tex, compression, srgb)
+    return tex
+
+
+def _ensure_flat_white_texture():
+    # Used as the Base_Color texture for materials with no Base Color image,
+    # so Base_Color_Tint alone determines the visible flat color instead of
+    # tinting MM_Standard_01's checker-pattern debug default.
+    return _ensure_flat_texture("T_BB_Flat_White", (255, 255, 255, 255))
+
+
+def _ensure_flat_orm_texture():
+    # White like T_BB_Flat_White (AO 1, roughness 1, metallic 1 -- metallic
+    # is ignored while the "Input ON/OFF" switch is off), but linear with
+    # Masks compression to match the ORM node's Masks sampler; an sRGB Color
+    # texture there is a sampler-type compile error.
+    return _ensure_flat_texture(
+        "T_BB_Flat_ORM", (255, 255, 255, 255), unreal.TextureCompressionSettings.TC_MASKS, False
+    )
+
+
+def _ensure_flat_normal_texture():
+    # (128, 128, 255) unpacks to a straight-up (0, 0, 1) tangent normal. Flat
+    # white would unpack to (1, 1, 1) -- a tilted normal that skews shading.
+    return _ensure_flat_texture(
+        "T_BB_Flat_Normal", (128, 128, 255, 255), unreal.TextureCompressionSettings.TC_NORMALMAP, False
+    )
+
+
+def _ensure_flat_black_texture():
+    return _ensure_flat_texture("T_BB_Flat_Black", (0, 0, 0, 255))
+
+
+def _fix_master_texture_defaults(material):
+    # MM_Standard_01's ORM/Normal/Emissive defaults used to point at
+    # /Game/Textures/Placeholder/... textures that don't exist in a fresh
+    # project, so those nodes fell back to Unreal's DefaultTexture checker.
+    # Roughness and AO read the ORM node unconditionally (the "Input ON/OFF"
+    # switch only swaps Metallic) and Normal reads its node unconditionally
+    # too, so any material with no ORM/normal image in Blender showed that
+    # checker even with its switches off. Point those defaults at flat
+    # textures instead. Only a missing default or an /Engine/ fallback is
+    # replaced -- a deliberately chosen default on a hand-authored master is
+    # left alone. Returns whether anything changed (caller recompiles/saves).
+    samplers = unreal.MaterialSamplerType
+    specs = {
+        "ORM": (_ensure_flat_orm_texture, samplers.SAMPLERTYPE_MASKS),
+        "Normal": (_ensure_flat_normal_texture, samplers.SAMPLERTYPE_NORMAL),
+        "Detail_Normal": (_ensure_flat_normal_texture, samplers.SAMPLERTYPE_NORMAL),
+        "Emissive": (_ensure_flat_black_texture, samplers.SAMPLERTYPE_COLOR),
+    }
+    changed = False
+    for expr in unreal.MaterialEditingLibrary.get_material_expressions(material):
+        if not isinstance(expr, unreal.MaterialExpressionTextureSampleParameter2D):
+            continue
+        spec = specs.get(str(expr.get_editor_property("parameter_name")))
+        if spec is None:
+            continue
+        current = expr.get_editor_property("texture")
+        if current is not None and not current.get_path_name().startswith("/Engine/"):
+            continue
+        getter, sampler = spec
+        tex = getter()
+        if tex is None:
+            unreal.log_warning(f"BB Unreal Export: could not create a flat default texture for {MASTER_MATERIAL_NAME}'s '{expr.get_editor_property('parameter_name')}'")
+            continue
+        expr.set_editor_property("texture", tex)
+        expr.set_editor_property("sampler_type", sampler)
+        changed = True
+    if changed:
+        unreal.log(f"BB Unreal Export: set flat ORM/Normal/Emissive defaults on {MASTER_MATERIAL_NAME} (replacing the engine checker)")
+    return changed
 
 
 def _instance_asset_name(mat_name):
@@ -668,20 +754,24 @@ def _ensure_material_instance(master, mat_name, base_color_tex, base_color_tint,
         MEL.set_material_instance_texture_parameter_value(instance, "Base_Color", base_color_tex)
     r, g, b, a = base_color_tint
     MEL.set_material_instance_vector_parameter_value(instance, "Base_Color_Tint", unreal.LinearColor(r, g, b, a))
-    # Only set a texture parameter when there's an actual texture to assign --
-    # passing None through to set_material_instance_texture_parameter_value
-    # has never been tested against a live editor, so this doesn't risk that
-    # call rejecting/erroring on a None value. The static switches, which
-    # only take a plain bool, ARE always (re)set either way -- that's what
-    # actually turns a stale "on" back off if a texture was removed in
-    # Blender since the instance was first created.
-    if normal_tex is not None:
-        MEL.set_material_instance_texture_parameter_value(instance, "Normal", normal_tex)
-    if emissive_tex is not None:
-        MEL.set_material_instance_texture_parameter_value(instance, "Emissive", emissive_tex)
+    # With no image in Blender, reset the parameter to the master's own
+    # default (the flat textures from _fix_master_texture_defaults) rather
+    # than leaving it alone -- that also clears a stale override if a
+    # texture was removed in Blender since the last run, and never passes
+    # None to set_material_instance_texture_parameter_value. A real image
+    # gets the same compression/sRGB as that default: a texture whose type
+    # doesn't match the node's sampler type (Normal/Masks) fails to compile.
+    # The static switches are always (re)set too -- that's what turns a stale
+    # "on" back off.
+    for param, tex in (("Normal", normal_tex), ("Emissive", emissive_tex), ("ORM", orm_tex)):
+        default = MEL.get_material_default_texture_parameter_value(master, param)
+        if tex is None:
+            tex = default
+        elif default is not None:
+            _set_texture_settings(tex, default.get_editor_property("compression_settings"), default.get_editor_property("srgb"))
+        if tex is not None:
+            MEL.set_material_instance_texture_parameter_value(instance, param, tex)
     MEL.set_material_instance_static_switch_parameter_value(instance, "Use Emissive Map", emissive_tex is not None)
-    if orm_tex is not None:
-        MEL.set_material_instance_texture_parameter_value(instance, "ORM", orm_tex)
     MEL.set_material_instance_static_switch_parameter_value(instance, "Input ON/OFF", orm_tex is not None)
 
     unreal.EditorAssetLibrary.save_asset(asset_path)
