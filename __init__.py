@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 9, 1),
+    "version": (1, 11, 2),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -26,6 +26,7 @@ bl_info = {
 }
 
 import bpy
+import bmesh
 import os
 import re
 import json
@@ -38,10 +39,51 @@ def _sanitize_filename(name):
     return cleaned or "Unnamed"
 
 
+def _mirror_sign_pattern(scale):
+    # A scale with an odd number of negative components (e.g. (-1,-1,-1), or
+    # just (-1,1,1)) is a true reflection, not a rotation -- its determinant
+    # is negative, so no combination of rotation + positive scale can
+    # reproduce it; some of Unreal's actor scale, or the geometry itself, has
+    # to carry a negative sign somewhere. Converting a reflected transform's
+    # sign correctly across the Blender (right-handed) <-> Unreal (left-
+    # handed) axis conversion this add-on already does for location/rotation
+    # is a much harder, easy-to-get-wrong problem than converting an ordinary
+    # rotation -- so mirrored objects are exported as their own baked-mirror
+    # asset instead (see _export_objects_to_fbx), sidestepping the question
+    # entirely. Returns the sign tuple if scale is mirrored, else None (the
+    # common case).
+    sx, sy, sz = scale
+    if (1 if sx >= 0 else -1) * (1 if sy >= 0 else -1) * (1 if sz >= 0 else -1) < 0:
+        return (1 if sx >= 0 else -1, 1 if sy >= 0 else -1, 1 if sz >= 0 else -1)
+    return None
+
+
 def _export_key(obj):
     # Objects that share the same mesh data only need to be exported once;
-    # each instance's own placement is recorded separately in the JSON.
+    # each instance's own placement is recorded separately in the JSON. A
+    # mirrored object (see _mirror_sign_pattern) is kept in its own group,
+    # separate from any non-mirrored objects sharing the same mesh data --
+    # it gets its own asset with the mirror baked into the geometry, rather
+    # than sharing an asset whose exported shape wouldn't match it.
     if obj.type == 'MESH' and obj.data is not None:
+        # Uses matrix_world.decompose()'s scale, NOT obj.scale, and must --
+        # confirmed live these can genuinely differ for the exact same
+        # object even with no parent involved (e.g. local scale (1,-1,1)
+        # decomposing to world scale (-1,-1,-1)): a reflection matrix has
+        # more than one valid (rotation, signed-scale) split, and Blender's
+        # decompose() doesn't necessarily pick the same one as the object's
+        # own .scale property. The JSON's exported rotation always comes
+        # from THIS SAME decompose() call (_write_transforms_json), so the
+        # geometry bake in _export_objects_to_fbx (which uses this sign
+        # pattern, in local mesh space -- exactly where a TRS decomposition's
+        # scale factor belongs) must use the identical decomposition or the
+        # two disagree about which sign was "already accounted for",
+        # producing a wrong final orientation even though each half looks
+        # individually correct.
+        _, _, world_scale = obj.matrix_world.decompose()
+        mirror = _mirror_sign_pattern(world_scale)
+        if mirror is not None:
+            return ('MESH_MIRRORED', obj.data.name, mirror)
         return ('MESH', obj.data.name)
     return ('OBJECT', obj.name)
 
@@ -128,10 +170,15 @@ def _export_targets(context):
 
 def _source_fbx_name(obj):
     # The FBX is named after the representative object that was actually
-    # exported for this mesh data (see BBUNREALEXPORT_OT_export_fbx), so the
-    # filename is human-readable instead of the raw mesh-data name.
+    # exported for this mesh data (see _export_objects_to_fbx), so the
+    # filename is human-readable instead of the raw mesh-data name. Checked
+    # on the object itself first -- a mirrored object's export group is
+    # tracked per-object rather than on its (shared-with-a-non-mirrored-twin)
+    # mesh data, since storing it there would collide between the two
+    # groups (see _export_key) -- falling back to the mesh-data-level
+    # property for the ordinary non-mirrored case.
     if obj.type == 'MESH' and obj.data is not None:
-        stored = obj.data.get("bb_unreal_export_name")
+        stored = obj.get("bb_unreal_export_name") or obj.data.get("bb_unreal_export_name")
         if stored:
             return _sanitize_filename(stored) + ".fbx"
     return _sanitize_filename(_export_key(obj)[1]) + ".fbx"
@@ -146,14 +193,52 @@ def _export_objects_to_fbx(context, objects, directory):
         rep = members[0]
         rep_name = _sanitize_filename(rep.name)
         filepath = os.path.join(directory, rep_name + ".fbx")
-        if rep.type == 'MESH' and rep.data is not None:
+
+        mirror = key[0] == 'MESH_MIRRORED'
+        if mirror:
+            # Every member of a mirrored group gets the resolved filename
+            # stored on the OBJECT itself (not the mesh data, which is
+            # shared with a non-mirrored twin outside this group -- storing
+            # it there would collide with that twin's own export).
+            for member in members:
+                member["bb_unreal_export_name"] = rep_name
+            original_mesh_data = rep.data
+            baked_mesh = original_mesh_data.copy()
+            sx, sy, sz = key[2]
+            baked_mesh.transform(Matrix.Diagonal((sx, sy, sz, 1.0)))
+            # A reflection inverts face winding order -- without this the
+            # baked mesh would render inside-out/backface-culled in Unreal.
+            # (Mesh has no flip_normals() method -- verified live -- reverse
+            # the winding via bmesh instead, which is what actually fixes
+            # both winding and the resulting normal direction together.)
+            bm = bmesh.new()
+            bm.from_mesh(baked_mesh)
+            bmesh.ops.reverse_faces(bm, faces=bm.faces)
+            bm.to_mesh(baked_mesh)
+            bm.free()
+            rep.data = baked_mesh
+        elif rep.type == 'MESH' and rep.data is not None:
             rep.data["bb_unreal_export_name"] = rep_name
+
         original_matrix = rep.matrix_world.copy()
 
         bpy.ops.object.select_all(action='DESELECT')
         rep.select_set(True)
         view_layer.objects.active = rep
 
+        # matrix_world = Identity resets location/rotation/scale together as
+        # one consistent decomposition -- for a mirrored object, restoring
+        # matrix_world afterward and THEN separately forcing .scale back to
+        # a saved value (as this used to do, "defensively") mixes two
+        # different, individually-valid decompositions of the same matrix:
+        # Blender can legitimately choose a different rotation/scale split
+        # when decomposing matrix_world back than the one originally
+        # captured via the plain .scale property, and pairing the "new"
+        # rotation with the "old" scale doesn't reproduce the original
+        # orientation. Confirmed live: this was corrupting the rotation of
+        # every mirrored object's export representative. matrix_world alone
+        # is sufficient and self-consistent -- no separate scale handling
+        # needed here at all, mirrored or not.
         rep.matrix_world = Matrix.Identity(4)
         view_layer.update()
 
@@ -170,6 +255,9 @@ def _export_objects_to_fbx(context, objects, directory):
         finally:
             rep.matrix_world = original_matrix
             view_layer.update()
+            if mirror:
+                rep.data = original_mesh_data
+                bpy.data.meshes.remove(baked_mesh)
 
     return exported
 
@@ -196,7 +284,14 @@ def _write_transforms_json(objects, filepath):
             "source_fbx": _source_fbx_name(obj),
             "location_m": [loc.x, loc.y, loc.z],
             "rotation_quat_wxyz": [rot.w, rot.x, rot.y, rot.z],
-            "scale": [scale.x, scale.y, scale.z],
+            # abs() -- a mirrored object's exported asset already has the
+            # reflection baked into its geometry (see _export_key /
+            # _export_objects_to_fbx), so the actor's own scale should only
+            # ever carry magnitude, never a sign that would double-apply it
+            # (or, worse, apply an unverified/unconverted negative sign on
+            # the Unreal side -- exactly the bug this whole mechanism exists
+            # to avoid).
+            "scale": [abs(scale.x), abs(scale.y), abs(scale.z)],
             "parent": obj.parent.name if obj.parent else None,
             "materials": materials,
         })
@@ -717,34 +812,30 @@ def _letter_sequence():
         yield label
 
 
-def _rename_sequential(prefix, members):
-    # Rename a chain of duplicates (e.g. foo_01, foo_01.001, foo_01.002) to
-    # foo_01, foo_02, foo_03, ... using the first member's zero-padded
-    # numeric style instead of Blender's automatic ".001" suffix.
-    width = len(members[0][1])
-    start = int(members[0][1])
-
-    # Rename through unique temporary names first so intermediate assignments
-    # never collide with another member of the group.
-    temp_objs = []
-    for i, (obj, digits, blend_suffix) in enumerate(members):
-        obj.name = f"__bb_renumber_tmp_{i}__{obj.name}"
-        temp_objs.append(obj)
-
-    for i, obj in enumerate(temp_objs):
-        obj.name = f"{prefix}{start + i:0{width}d}"
-
-    return len(temp_objs)
-
-
 def _renumber_objects(objects):
-    # Group by name prefix (the text before the trailing number, ignoring
-    # Blender's own ".001" uniqueness suffix), then split each group by mesh
-    # geometry (see _split_by_geometry) before renumbering -- a group with
-    # more than one distinct shape gets a letter inserted per shape
-    # (foo_A_01, foo_B_01, ...) so the different meshes end up with
-    # unambiguously different names, and _relink_copies_as_instances (which
-    # re-groups by the *new* name afterward) can never merge them together.
+    # Group by the full original name -- prefix AND number together, e.g.
+    # "SM_Deco_06" -- ignoring only Blender's own ".001" uniqueness suffix.
+    # Blender only ever appends ".001"/".002" to a duplicate of the EXACT
+    # SAME name, so that's the real signal for "these are copies of one
+    # original"; grouping by the text prefix alone (as an earlier version of
+    # this did) incorrectly swept up any objects that merely share a naming
+    # convention with DIFFERENT original numbers -- e.g. "SM_Deco_04"
+    # through "SM_Deco_23", 20 individually-numbered pieces sharing the
+    # generic "SM_Deco_" prefix but never duplicates of each other, all got
+    # treated as one renumbering chain and reshuffled. Then split each true
+    # group by mesh geometry (see _split_by_geometry) before renumbering -- a
+    # group with more than one distinct shape gets a letter inserted per
+    # shape (foo_A_01, foo_B_01, ...) so the different meshes end up with
+    # unambiguously different names.
+    #
+    # Returns (renamed_count, skipped_count, renamed_subgroups) -- the third
+    # value is the exact list of object-groups this function identified and
+    # renamed (each already geometry-verified as one true shape), for
+    # _relink_copies_as_instances to relink directly. It used to instead
+    # re-derive groups itself from the (now renamed) prefix alone, which hit
+    # the exact same false-grouping bug a second time, independently of this
+    # function -- passing the already-correct groups through avoids ever
+    # having to re-derive "was this really one duplicate chain?" from names.
     groups = {}
     skipped = 0
     for obj in objects:
@@ -752,46 +843,91 @@ def _renumber_objects(objects):
         if digits is None:
             skipped += 1
             continue
-        groups.setdefault(prefix, []).append((obj, digits, blend_suffix))
+        core_key = prefix + digits
+        groups.setdefault(core_key, []).append((obj, prefix, digits, blend_suffix))
 
-    renamed = 0
-    for prefix, members in groups.items():
-        members.sort(key=lambda m: (0, 0) if m[2] is None else (1, m[2]))
-        subgroups = _split_by_geometry(members)
-
-        if len(subgroups) == 1:
-            renamed += _rename_sequential(prefix, subgroups[0])
-        else:
-            for letter, sub_members in zip(_letter_sequence(), subgroups):
-                new_prefix = prefix.rstrip('_') + f"_{letter}_"
-                renamed += _rename_sequential(new_prefix, sub_members)
-
-    return renamed, skipped
-
-
-def _relink_copies_as_instances(objects):
-    # Group by the *current* name (post-renumber, so foo_01/foo_02/foo_03
-    # naming is consistent), and for each group make every member share the
-    # mesh data of the lowest-numbered member -- turning a "Make Single
-    # User"/non-linked duplicate (its own separate mesh copy) back into a
-    # proper linked instance (shared mesh data), which is what lets the
-    # exporter dedupe them into a single FBX.
-    groups = {}
-    for obj in objects:
-        if obj.type != 'MESH' or obj.data is None:
-            continue
-        prefix, digits, _ = _split_base_and_number(obj.name)
-        if digits is None:
-            continue
-        groups.setdefault(prefix, []).append((obj, int(digits)))
-
-    relinked = 0
-    for prefix, members in groups.items():
+    real_groups = []  # (prefix, [(obj, digits, blend_suffix), ...])
+    for core_key, members in groups.items():
         if len(members) < 2:
             continue
-        members.sort(key=lambda m: m[1])
-        original_data = members[0][0].data
-        for obj, _ in members[1:]:
+        members.sort(key=lambda m: (0, 0) if m[3] is None else (1, m[3]))
+        prefix = members[0][1]
+        plain_members = [(obj, digits, blend_suffix) for obj, _, digits, blend_suffix in members]
+        subgroups = _split_by_geometry(plain_members)
+        if len(subgroups) == 1:
+            real_groups.append((prefix, subgroups[0]))
+        else:
+            for letter, sub_members in zip(_letter_sequence(), subgroups):
+                real_groups.append((prefix.rstrip('_') + f"_{letter}_", sub_members))
+
+    if not real_groups:
+        return 0, skipped, []
+
+    # Every object name currently in the file -- not just the ones being
+    # renumbered -- so a candidate number already used by some unrelated
+    # object elsewhere is never assigned to a duplicate.
+    used_names = {o.name for o in bpy.data.objects}
+
+    # Three explicit phases across ALL groups together, rather than handling
+    # one group fully before moving to the next. Confirmed live why this
+    # matters: with several separately-numbered duplicate pairs sitting at
+    # adjacent numbers (Deco_06/06.001, Deco_07/07.001, Deco_08/08.001,
+    # Deco_09/09.001), finishing one pair before starting the next made an
+    # EARLIER pair's duplicate see a LATER pair's still-unrenamed original
+    # name as "taken" and skip needlessly far past it looking for a free
+    # slot -- producing a scattered, order-dependent result even though each
+    # individual rename was collision-free. Reserving every group's own
+    # anchor number up front (phase 2) before any group searches for a slot
+    # for its duplicates (phase 3) means a duplicate only ever has to skip
+    # past numbers that are genuinely, permanently taken by another group's
+    # own original piece -- landing all of them cleanly past the whole
+    # family's range instead of scattered through the middle of it.
+    prepared = []  # (prefix, width, first_num, [temp_obj, ...])
+    for prefix, sub_members in real_groups:  # phase 1: free every touched name
+        width = len(sub_members[0][1])
+        first_num = int(sub_members[0][1])
+        temp_objs = []
+        for i, (obj, digits, blend_suffix) in enumerate(sub_members):
+            used_names.discard(obj.name)
+            obj.name = f"__bb_renumber_tmp_{id(obj)}_{i}__"
+            temp_objs.append(obj)
+        prepared.append((prefix, width, first_num, temp_objs))
+
+    for prefix, width, first_num, temp_objs in prepared:  # phase 2: reclaim each group's own anchor number
+        name = f"{prefix}{first_num:0{width}d}"
+        temp_objs[0].name = name
+        used_names.add(name)
+
+    renamed_subgroups = []
+    for prefix, width, first_num, temp_objs in prepared:  # phase 3: place the remaining duplicates
+        n = first_num + 1
+        for obj in temp_objs[1:]:
+            while f"{prefix}{n:0{width}d}" in used_names:
+                n += 1
+            name = f"{prefix}{n:0{width}d}"
+            obj.name = name
+            used_names.add(name)
+            n += 1
+        renamed_subgroups.append(temp_objs)
+
+    renamed = sum(len(g) for g in renamed_subgroups)
+    return renamed, skipped, renamed_subgroups
+
+
+def _relink_copies_as_instances(subgroups):
+    # Takes the exact subgroups _renumber_objects identified and renamed
+    # (each already confirmed to share matching mesh geometry) and makes
+    # every member share the first (lowest-numbered) member's mesh data --
+    # turning a "Make Single User"/non-linked duplicate (its own separate
+    # mesh copy) back into a proper linked instance (shared mesh data),
+    # which is what lets the exporter dedupe them into a single FBX.
+    relinked = 0
+    for members in subgroups:
+        mesh_members = [obj for obj in members if obj.type == 'MESH' and obj.data is not None]
+        if len(mesh_members) < 2:
+            continue
+        original_data = mesh_members[0].data
+        for obj in mesh_members[1:]:
             if obj.data is not original_data:
                 obj.data = original_data
                 relinked += 1
@@ -843,39 +979,32 @@ class BBUNREALEXPORT_OT_cleanup(bpy.types.Operator):
         "mesh data, turning copies back into linked instances, and resets "
         "any material's Base Color to white wherever something's plugged "
         "into it (a stale/leftover value there would otherwise silently tint "
-        "an exported texture). Uses the current selection, or every object "
-        "in the selected Outliner collection(s) when Per Collection is on"
+        "an exported texture). Runs on every object in the scene -- no "
+        "selection or Per Collection needed"
     )
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        # Matches Export All's own Per Collection behavior: when it's on,
-        # operate on every object in each selected Outliner collection
-        # (processed independently per collection, so renumbering in one
-        # collection never mixes with another's), instead of only the
-        # current viewport selection.
-        targets = _export_targets(context)
-        all_objects = [obj for _, objects in targets for obj in objects]
+        # Runs on the whole scene rather than the current selection or a
+        # chosen Outliner collection. Cleanup, unlike Export, doesn't need
+        # to keep anything scoped to a particular collection -- it's pure
+        # Blender-side data hygiene -- and requiring a selection turned out
+        # to be pure friction in practice: a duplicate pair can easily end
+        # up with one half selected and not the other, or split across two
+        # collections not both highlighted, silently doing nothing either
+        # way with no indication why. Working on everything sidesteps that
+        # entirely.
+        all_objects = list(context.scene.objects)
         if not all_objects:
-            message = "No collections selected in the Outliner" if context.scene.bb_unreal_export_per_collection else "No objects selected"
-            self.report({'WARNING'}, message)
+            self.report({'WARNING'}, "Scene has no objects")
             return {'CANCELLED'}
 
-        total_renamed = 0
-        total_skipped = 0
-        total_relinked = 0
-        for _, objects in targets:
-            if not objects:
-                continue
-            renamed, skipped = _renumber_objects(objects)
-            total_renamed += renamed
-            total_skipped += skipped
-            total_relinked += _relink_copies_as_instances(objects)
-
+        total_renamed, total_skipped, renamed_subgroups = _renumber_objects(all_objects)
+        total_relinked = _relink_copies_as_instances(renamed_subgroups)
         whitened = _whiten_connected_base_colors(all_objects)
 
         if total_renamed == 0 and total_skipped == len(all_objects) and whitened == 0:
-            self.report({'WARNING'}, "No numbered base names found in selection, and no Base Color needed resetting")
+            self.report({'WARNING'}, "No numbered base names found, and no Base Color needed resetting")
             return {'CANCELLED'}
 
         message = f"Renumbered {total_renamed} object(s), relinked {total_relinked} cop{'y' if total_relinked == 1 else 'ies'} to shared mesh data"

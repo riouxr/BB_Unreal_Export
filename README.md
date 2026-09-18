@@ -33,6 +33,25 @@ click the second button.
   the representative object (not the raw mesh-data name), so the resulting
   `.fbx` (and Unreal static mesh asset) has a readable name. FBX export
   options: Selected Only, Apply Unit **off**, Use Space Transform **on**.
+
+  A **mirrored object** (a negative/reflected scale, e.g. `(-1,-1,-1)` —
+  common for a flipped roof tile, trim piece, gutter, etc. sharing mesh data
+  with its non-mirrored twin) is never grouped with a non-mirrored object
+  sharing the same mesh data — it always gets its own asset, with the mirror
+  baked directly into the exported geometry (winding/normals corrected too)
+  instead of being carried as a negative scale on the Unreal side.
+  Converting a reflection's sign correctly across Blender's right-handed and
+  Unreal's left-handed axis conventions is a much harder, easy-to-get-wrong
+  problem than an ordinary rotation, so this sidesteps it entirely — the
+  JSON's recorded `scale` for a mirrored object is always positive magnitude
+  only. The sign baked into the geometry always comes from the object's
+  **world**-space decomposition (`matrix_world.decompose()`), the same
+  decomposition the exported rotation itself comes from -- not the object's
+  own local scale property, which can legitimately disagree with it for a
+  reflected transform (Blender's own decomposition isn't unique). Using two
+  different decompositions for the geometry bake and the rotation was a real
+  bug found live: each half looked individually reasonable, but together
+  they didn't reproduce the correct final orientation.
 - **Export XYZ and Materials** — writes a JSON with every selected object's
   name, source FBX, world location/rotation/scale (location in meters,
   rotation as a quaternion, in Blender's right-handed Z-up space), parent
@@ -61,17 +80,30 @@ data rather than a linked instance), makes them share the lowest-numbered
 member's mesh data again, turning them back into proper linked instances
 (which is what lets the exporter dedupe them into a single FBX).
 
-Sharing a name pattern doesn't necessarily mean the same mesh — `foo_01` and
-`foo_02` can be two genuinely different objects that just happen to follow
-the same naming convention. Before renumbering/relinking, each name group is
-checked for matching mesh geometry (vertex/edge/polygon counts, face
-topology, and bounding box); a group containing more than one distinct shape
-is split so each shape gets its own letter inserted — `foo_A_01`, `foo_B_01`,
-... — instead of being merged and relinked into the wrong mesh.
+Sharing a name pattern doesn't necessarily mean the same mesh, and Blender
+only ever appends `.001`/`.002` to a duplicate of the exact same name — so
+grouping is by the full original name (prefix **and** number), not just the
+text prefix. `foo_04` through `foo_23` (20 individually-numbered pieces
+sharing the generic `foo_` prefix, never duplicates of each other) are left
+alone; only `foo_06`/`foo_06.001`-style pairs sharing an actual original
+number get renumbered together. Within a true group, mesh geometry is also
+checked (vertex/edge/polygon counts, face topology, bounding box) before
+relinking — a group containing more than one distinct shape is split so each
+shape gets its own letter inserted (`foo_A_01`, `foo_B_01`, ...) instead of
+being merged into the wrong mesh. Renumbering a duplicate never picks a
+number already used by anything else in the file, even a different,
+unrelated duplicate pair sitting at an adjacent number.
 
-Uses the current viewport selection, or every object in the selected
-Outliner collection(s) (processed independently, one collection at a time)
-when **Per Collection** is on.
+Also resets a material's Base Color to white wherever something's connected
+to it (a texture, or routed through an Ambient Occlusion node) — that socket
+freezes at whatever value it had before linking, so a stale/leftover color
+can silently tint an exported texture.
+
+Runs on every object in the scene every time — no selection, viewport
+selection, or Outliner collection needed. A true duplicate pair can easily
+end up split across two different collections (one half moved at some
+point), so Cleanup deliberately doesn't scope itself to whatever's
+selected/highlighted.
 
 ### Collect Textures
 
@@ -258,8 +290,18 @@ Blender is meters, Z-up, right-handed (X right, Y forward). Unreal is
 centimeters, Z-up, left-handed. The script converts each transform with:
 
 - location: `(x, -y, z) * 100`
-- rotation: mirror the quaternion about the XZ plane (`y`, `z` negated)
-- scale: unchanged
+- rotation: `x` and `z` negated (`y` and `w` unchanged) -- this is the actual
+  similarity transform `R_unreal = C * R_blender * C^-1` for the
+  change-of-basis `C = diag(1,-1,1)` the location conversion uses, not just
+  a per-component sign guess. An earlier version of this negated `y`/`z`
+  instead of `x`/`z`, which happens to give the identical result for any
+  rotation purely about the Z axis (the common case for an architectural
+  scene's walls/columns/doors) -- invisible until an object with a real X or
+  Y rotation component (e.g. a tilted roof piece) exposed it. Verified
+  numerically against the full 3x3 conjugation, not just spot-checked.
+- scale: unchanged (except a mirrored/reflected object -- see **Mirrored
+  objects** above -- whose sign is baked into the geometry instead, so its
+  recorded scale is always a positive magnitude)
 
 This matches the axis convention Blender's FBX exporter already uses for the
 mesh geometry itself (Forward `-Y`, Up `Z`, Use Space Transform on), so a

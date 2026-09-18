@@ -150,9 +150,28 @@ def blender_to_unreal_location(loc_m):
 
 
 def blender_to_unreal_rotation(quat_wxyz):
-    """Mirror about the XZ plane to flip handedness, matching the location conversion."""
+    # Converting a rotation between two coordinate systems related by a
+    # change-of-basis matrix C (here C = diag(1,-1,1), the same Y-negation
+    # blender_to_unreal_location uses) is a similarity transform:
+    # R_unreal = C @ R_blender @ C^-1, not a plain per-component sign flip.
+    # Working out that matrix product in terms of quaternion components gives
+    # w'=w, x'=-x, y'=y, z'=-z (negate X and Z, keep Y and W) -- confirmed
+    # numerically against the full 3x3 conjugation for both a compound
+    # rotation and a pure-Z rotation.
+    #
+    # The previous formula here (negate Y and Z, keep X and W) was wrong,
+    # but invisibly so for any rotation with x=0 and y=0 (a rotation purely
+    # about the Z axis) -- negating a zero does nothing, so both formulas
+    # agree exactly for pure-Z rotations, which is the vast majority of a
+    # typical architectural scene (walls, columns, doors). It only produces
+    # a visibly wrong orientation once a rotation has a real X or Y
+    # component, e.g. a tilted/sloped roof piece -- confirmed live: this
+    # exact bug was diagnosed from a roof corner piece landing flat/detached
+    # in Unreal despite matching location and Blender-reported rotation
+    # values, traced to this formula via a full quaternion/matrix derivation
+    # rather than guessed.
     w, x, y, z = quat_wxyz
-    uquat = unreal.Quat(x=x, y=-y, z=-z, w=w)
+    uquat = unreal.Quat(x=-x, y=y, z=-z, w=w)
     uquat.normalize()
     return uquat.rotator()
 
