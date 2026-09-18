@@ -488,8 +488,30 @@ def _ensure_master_material():
     _build_master_material(material)
 
     unreal.MaterialEditingLibrary.recompile_material(material)
-    unreal.EditorAssetLibrary.save_asset(master_path)
-    unreal.log(f"BB Unreal Export: built and saved '{master_path}'")
+
+    # save_asset's return value was never checked here -- confirmed live on
+    # a Perforce-controlled project: the material built and worked fine
+    # in-memory for the rest of that same session (instances parented to it
+    # saved to disk just fine), but the .uasset for the master itself was
+    # never written at all, with nothing logged about it failing. Check the
+    # result, fall back to the broader save_dirty_packages (already proven
+    # reliable elsewhere in this script for a different post-move save), and
+    # if it still didn't take, say so loudly instead of losing it silently --
+    # this is the one file everything else in the project ends up parented
+    # to, so silently not persisting it is a big deal.
+    saved = unreal.EditorAssetLibrary.save_asset(master_path)
+    if not saved or not unreal.EditorAssetLibrary.does_asset_exist(master_path):
+        unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)
+    if unreal.EditorAssetLibrary.does_asset_exist(master_path):
+        unreal.log(f"BB Unreal Export: built and saved '{master_path}'")
+    else:
+        unreal.log_error(
+            f"BB Unreal Export: built {MASTER_MATERIAL_NAME} but could not save it to disk at '{master_path}' -- "
+            "it will work for the rest of this editor session (instances parenting to it will still save fine) "
+            "but will be LOST when the editor closes unless you save it by hand (right-click the asset in the "
+            "Content Browser > Save, or File > Save All). On a source-controlled project this usually means the "
+            "file needs to be checked out or marked for add first."
+        )
     return material
 
 
