@@ -51,12 +51,27 @@ collection's objects (including nested sub-collections, via
 collection, with their own self-contained transforms JSON named after the
 collection too (e.g. `Wall/Wall.json`, `Wall/*.fbx`).
 
-### Renumber Selected
+### Cleanup
 
 Blender's own duplicate naming turns `foo_01` into `foo_01.001`,
-`foo_01.002`, etc. This button renumbers a selected chain of duplicates using
-the original's zero-padded numeric style instead — `foo_01`, `foo_02`,
-`foo_03`, ...
+`foo_01.002`, etc. This button renumbers a chain of duplicates using the
+original's zero-padded numeric style instead — `foo_01`, `foo_02`,
+`foo_03`, ... — then, for any full-copy duplicates (their own separate mesh
+data rather than a linked instance), makes them share the lowest-numbered
+member's mesh data again, turning them back into proper linked instances
+(which is what lets the exporter dedupe them into a single FBX).
+
+Sharing a name pattern doesn't necessarily mean the same mesh — `foo_01` and
+`foo_02` can be two genuinely different objects that just happen to follow
+the same naming convention. Before renumbering/relinking, each name group is
+checked for matching mesh geometry (vertex/edge/polygon counts, face
+topology, and bounding box); a group containing more than one distinct shape
+is split so each shape gets its own letter inserted — `foo_A_01`, `foo_B_01`,
+... — instead of being merged and relinked into the wrong mesh.
+
+Uses the current viewport selection, or every object in the selected
+Outliner collection(s) (processed independently, one collection at a time)
+when **Per Collection** is on.
 
 ### Collect Textures
 

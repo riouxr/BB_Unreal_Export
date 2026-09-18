@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 8, 1),
+    "version": (1, 9, 1),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -654,10 +654,97 @@ class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _mesh_geometry_signature(mesh, precision=4):
+    # A fast, good-enough "is this the same shape" fingerprint -- vertex/edge/
+    # polygon counts, each face's vertex count (a topology signal: tells a
+    # 6-quad box apart from a 12-tri one even if vert/edge/poly counts happen
+    # to coincide), and the local-space bounding box rounded to `precision`
+    # decimals (so floating point noise between two copies of the same
+    # duplicate doesn't compare unequal). NOT a full per-vertex comparison --
+    # meant to catch "these share a name pattern by coincidence but are
+    # different meshes", not to certify byte-identical geometry.
+    if mesh is None or not mesh.vertices:
+        return None
+    verts = mesh.vertices
+    xs = [v.co.x for v in verts]
+    ys = [v.co.y for v in verts]
+    zs = [v.co.z for v in verts]
+    bbox = (
+        round(max(xs) - min(xs), precision),
+        round(max(ys) - min(ys), precision),
+        round(max(zs) - min(zs), precision),
+    )
+    loop_counts = tuple(sorted(p.loop_total for p in mesh.polygons))
+    return (len(verts), len(mesh.edges), len(mesh.polygons), loop_counts, bbox)
+
+
+def _split_by_geometry(members):
+    # members: list of (obj, digits, blend_suffix) sharing the same name
+    # prefix. A shared prefix/number pattern (e.g. foo_01, foo_02) doesn't
+    # mean the same mesh -- they can be two genuinely different objects that
+    # just happen to follow the same naming convention. Only mesh objects can
+    # be geometry-compared, so if the group has any non-mesh member (or a
+    # mesh missing its data), skip splitting and treat it as one group like
+    # before. Otherwise, partition by _mesh_geometry_signature, in the order
+    # each distinct shape was first seen (i.e. anchored by its lowest-numbered
+    # instance).
+    if any(m[0].type != 'MESH' or m[0].data is None for m in members):
+        return [members]
+
+    signature_order = []
+    buckets = {}
+    for member in members:
+        sig = _mesh_geometry_signature(member[0].data)
+        if sig not in buckets:
+            buckets[sig] = []
+            signature_order.append(sig)
+        buckets[sig].append(member)
+    return [buckets[sig] for sig in signature_order]
+
+
+def _letter_sequence():
+    # Spreadsheet-column-style labels: A, B, ..., Z, AA, AB, ... -- so more
+    # than 26 distinct geometry variants sharing one name prefix still get
+    # unique labels instead of erroring out.
+    n = 0
+    while True:
+        n += 1
+        label = ""
+        k = n
+        while k > 0:
+            k, rem = divmod(k - 1, 26)
+            label = chr(ord('A') + rem) + label
+        yield label
+
+
+def _rename_sequential(prefix, members):
+    # Rename a chain of duplicates (e.g. foo_01, foo_01.001, foo_01.002) to
+    # foo_01, foo_02, foo_03, ... using the first member's zero-padded
+    # numeric style instead of Blender's automatic ".001" suffix.
+    width = len(members[0][1])
+    start = int(members[0][1])
+
+    # Rename through unique temporary names first so intermediate assignments
+    # never collide with another member of the group.
+    temp_objs = []
+    for i, (obj, digits, blend_suffix) in enumerate(members):
+        obj.name = f"__bb_renumber_tmp_{i}__{obj.name}"
+        temp_objs.append(obj)
+
+    for i, obj in enumerate(temp_objs):
+        obj.name = f"{prefix}{start + i:0{width}d}"
+
+    return len(temp_objs)
+
+
 def _renumber_objects(objects):
-    # Rename a selected chain of duplicates (e.g. foo_01, foo_01.001,
-    # foo_01.002) to foo_01, foo_02, foo_03, ... using the original's
-    # zero-padded numeric style instead of Blender's automatic suffix.
+    # Group by name prefix (the text before the trailing number, ignoring
+    # Blender's own ".001" uniqueness suffix), then split each group by mesh
+    # geometry (see _split_by_geometry) before renumbering -- a group with
+    # more than one distinct shape gets a letter inserted per shape
+    # (foo_A_01, foo_B_01, ...) so the different meshes end up with
+    # unambiguously different names, and _relink_copies_as_instances (which
+    # re-groups by the *new* name afterward) can never merge them together.
     groups = {}
     skipped = 0
     for obj in objects:
@@ -670,19 +757,14 @@ def _renumber_objects(objects):
     renamed = 0
     for prefix, members in groups.items():
         members.sort(key=lambda m: (0, 0) if m[2] is None else (1, m[2]))
-        width = len(members[0][1])
-        start = int(members[0][1])
+        subgroups = _split_by_geometry(members)
 
-        # Rename through unique temporary names first so intermediate
-        # assignments never collide with another member of the group.
-        temp_objs = []
-        for i, (obj, digits, blend_suffix) in enumerate(members):
-            obj.name = f"__bb_renumber_tmp_{i}__{obj.name}"
-            temp_objs.append(obj)
-
-        for i, obj in enumerate(temp_objs):
-            obj.name = f"{prefix}{start + i:0{width}d}"
-            renamed += 1
+        if len(subgroups) == 1:
+            renamed += _rename_sequential(prefix, subgroups[0])
+        else:
+            for letter, sub_members in zip(_letter_sequence(), subgroups):
+                new_prefix = prefix.rstrip('_') + f"_{letter}_"
+                renamed += _rename_sequential(new_prefix, sub_members)
 
     return renamed, skipped
 
@@ -717,33 +799,90 @@ def _relink_copies_as_instances(objects):
     return relinked
 
 
+def _whiten_connected_base_colors(objects):
+    # A material's Base Color socket only reflects a *live* value while
+    # nothing is plugged into it -- once something is connected (an image
+    # texture directly, or routed through an Ambient Occlusion node, see
+    # _resolve_flat_color), Blender freezes default_value at whatever it was
+    # right before linking instead of keeping it in sync. That frozen value
+    # can silently carry forward a stale/leftover color (e.g. from testing) with
+    # nothing in the UI flagging it, and it leaks straight into the exported
+    # JSON's base_color_value / Unreal's Base_Color_Tint, tinting a real
+    # texture with an unintended color. Reset it to white whenever something's
+    # connected, so it can never do that.
+    seen = set()
+    changed = 0
+    for obj in objects:
+        if obj.type != 'MESH' or obj.data is None:
+            continue
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is None or mat.name in seen:
+                continue
+            seen.add(mat.name)
+            bsdf = _find_principled_bsdf(mat)
+            if bsdf is None:
+                continue
+            socket = bsdf.inputs.get('Base Color')
+            if socket is None or not socket.is_linked:
+                continue
+            if tuple(socket.default_value) != (1.0, 1.0, 1.0, 1.0):
+                socket.default_value = (1.0, 1.0, 1.0, 1.0)
+                changed += 1
+    return changed
+
+
 class BBUNREALEXPORT_OT_cleanup(bpy.types.Operator):
     bl_idname = "bb_unreal_export.cleanup"
     bl_label = "Cleanup"
     bl_description = (
-        "Renumber selected duplicates (foo_01.001 -> foo_02, ...), then make "
-        "any full-copy duplicates share the same mesh data as the "
-        "lowest-numbered object in their group, turning copies back into "
-        "linked instances"
+        "Renumber duplicates (foo_01.001 -> foo_02, ...) -- checking mesh "
+        "geometry first, so different meshes that happen to share a name "
+        "pattern are split into their own group (foo_A_01, foo_B_01, ...) "
+        "instead of being merged -- then relinks true duplicates to share "
+        "mesh data, turning copies back into linked instances, and resets "
+        "any material's Base Color to white wherever something's plugged "
+        "into it (a stale/leftover value there would otherwise silently tint "
+        "an exported texture). Uses the current selection, or every object "
+        "in the selected Outliner collection(s) when Per Collection is on"
     )
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        selected = list(context.selected_objects)
-        if not selected:
-            self.report({'WARNING'}, "No objects selected")
+        # Matches Export All's own Per Collection behavior: when it's on,
+        # operate on every object in each selected Outliner collection
+        # (processed independently per collection, so renumbering in one
+        # collection never mixes with another's), instead of only the
+        # current viewport selection.
+        targets = _export_targets(context)
+        all_objects = [obj for _, objects in targets for obj in objects]
+        if not all_objects:
+            message = "No collections selected in the Outliner" if context.scene.bb_unreal_export_per_collection else "No objects selected"
+            self.report({'WARNING'}, message)
             return {'CANCELLED'}
 
-        renamed, skipped = _renumber_objects(selected)
-        if renamed == 0 and skipped == len(selected):
-            self.report({'WARNING'}, "No numbered base names found in selection")
+        total_renamed = 0
+        total_skipped = 0
+        total_relinked = 0
+        for _, objects in targets:
+            if not objects:
+                continue
+            renamed, skipped = _renumber_objects(objects)
+            total_renamed += renamed
+            total_skipped += skipped
+            total_relinked += _relink_copies_as_instances(objects)
+
+        whitened = _whiten_connected_base_colors(all_objects)
+
+        if total_renamed == 0 and total_skipped == len(all_objects) and whitened == 0:
+            self.report({'WARNING'}, "No numbered base names found in selection, and no Base Color needed resetting")
             return {'CANCELLED'}
 
-        relinked = _relink_copies_as_instances(selected)
-
-        message = f"Renumbered {renamed} object(s), relinked {relinked} cop{'y' if relinked == 1 else 'ies'} to shared mesh data"
-        if skipped:
-            message += f", skipped {skipped} with no trailing number"
+        message = f"Renumbered {total_renamed} object(s), relinked {total_relinked} cop{'y' if total_relinked == 1 else 'ies'} to shared mesh data"
+        if total_skipped:
+            message += f", skipped {total_skipped} with no trailing number"
+        if whitened:
+            message += f", reset Base Color to white on {whitened} material{'s' if whitened != 1 else ''}"
         self.report({'INFO'}, message)
         return {'FINISHED'}
 
