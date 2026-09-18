@@ -1,0 +1,18 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "BB Unreal Export Tools",
+	"Description": "Registers the 'BB Unreal Export: Rebuild Scene' Tools menu entry for the BB_Unreal_Export Blender-to-Unreal pipeline, for every project on this engine install.",
+	"Category": "Scripting",
+	"CreatedBy": "BB",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EnabledByDefault": true,
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false
+}

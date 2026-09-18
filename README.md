@@ -17,7 +17,7 @@ from Disk, or drag-and-drop the release zip).
 3. Select objects (or turn on **Per Collection**, see below) and click
    **Export All**.
 
-### Export All / Export FBX Only / Export Geo Transforms Only
+### Export All / Export FBX Only / Export XYZ and Materials
 
 **Export All** reads the current selection once and does both steps below
 together — use this by default. The two "Only" buttons exist for manual
@@ -33,10 +33,13 @@ click the second button.
   the representative object (not the raw mesh-data name), so the resulting
   `.fbx` (and Unreal static mesh asset) has a readable name. FBX export
   options: Selected Only, Apply Unit **off**, Use Space Transform **on**.
-- **Export Geo Transforms** — writes a JSON with every selected object's
+- **Export XYZ and Materials** — writes a JSON with every selected object's
   name, source FBX, world location/rotation/scale (location in meters,
-  rotation as a quaternion, in Blender's right-handed Z-up space), and parent
-  name (recorded for reference; not auto-attached in Unreal).
+  rotation as a quaternion, in Blender's right-handed Z-up space), parent
+  name (recorded for reference; not auto-attached in Unreal), and material
+  info (see **Material info in the transforms JSON** below — this always
+  reads and writes material data, regardless of which export button is
+  clicked; it does not copy texture files, though, that's Collect Textures).
 
 ### Per Collection
 
@@ -68,7 +71,7 @@ generated/procedural) are skipped and reported by name.
 
 ### Material info in the transforms JSON
 
-**Export Geo Transforms** (and **Export All**) also reads each selected
+**Export XYZ and Materials** (and **Export All**) also reads each selected
 object's materials and records, per Blender material, which texture plays
 which role — read directly from the material's actual Principled BSDF node
 graph, not guessed from a filename:
@@ -131,9 +134,32 @@ Edit the top of the script first:
   under (see **Content organization** below)
 - `DEFAULT_CREATE_LEVEL_INSTANCE` — see below (overridden by the Tools menu
   checkbox)
+- `DEFAULT_MODE` — see **Modes** below (overridden by the Tools menu's radio
+  buttons)
 
 `FBX_DIR` is always the JSON's own folder — the exported FBX files must sit
 next to it.
+
+### Modes
+
+The Tools menu dialog (and `DEFAULT_MODE`/`BB_MODE`) offers three modes:
+
+- **Full Rebuild** (default) — the normal path described above: import each
+  FBX (skipped if the asset already exists), spawn/respawn every actor,
+  rebuild materials, regroup into the Level Instance.
+- **Materials Only** — reapplies materials from the JSON's `"materials"`
+  dict to whatever's already imported under `<COLLECTION_LABEL>_Mesh`. No
+  FBX import, no actors spawned or moved, no Level Instance touched. For
+  picking up a Blender-side material/color tweak without paying for a full
+  mesh reimport + actor respawn + Level Instance rebuild every time. Requires
+  the meshes to already exist (run a Full Rebuild at least once first) — a
+  mesh not found there is logged and skipped, not imported on the fly.
+- **Transforms Only** — moves already-spawned actors (matched by label,
+  i.e. object name) to match the JSON's current location/rotation/scale. No
+  FBX import, no material changes, no Level Instance rebuild — actors keep
+  whatever Level Instance/sub-level they're already in. Requires the actors
+  to already exist (run a Full Rebuild at least once first) — an actor not
+  found is logged and skipped, not spawned.
 
 ### Content organization
 
@@ -183,16 +209,18 @@ missing textures) and instead rebuilds materials straight from the JSON's
   -- function-call input pin names -- is a best guess that couldn't be
   tested live).
 - For each unique Blender material referenced by an object's material
-  slots, an instance named `MI_<BlenderMaterialName>_01` is created once and
+  slots, an instance named `MI_<BlenderMaterialName>_01` is created once (by
+  name -- the asset itself is never deleted/recreated on a later run) and
   reused for every part that uses it (matching how the old native FBX
-  material import worked -- one asset per material, shared across parts)
+  material import worked -- one asset per material, shared across parts),
   with `Base_Color`/`Normal`/`ORM`/`Emissive` set from the JSON's recorded
   filenames, imported from `TEXTURES_DIR` (`FBX_DIR/Textures`, populated by
-  Blender's **Collect Textures** button -- see above). Dedup is purely by
-  name, not by comparing resolved textures, so once an instance exists it's
-  never overwritten on a later run -- delete `MI_<name>_01` by hand first if
-  you want a rerun to pick up a material change from Blender (same as
-  `MM_Standard_01`).
+  Blender's **Collect Textures** button -- see above), and its parent reset
+  to `MM_Standard_01` every run. Unlike the asset itself, these parameter
+  values ARE resynced on every run, whether the instance is fresh or already
+  existed -- so re-running after tweaking a material's color/texture in
+  Blender (including via **Materials Only** mode, see below) picks up the
+  change with no manual deletion needed.
 - A mesh's material slot count and the JSON's material list are matched by
   position; a mismatch (or a material with no recorded info, e.g. one that
   wasn't a plain Principled BSDF hookup in Blender) is logged and that slot

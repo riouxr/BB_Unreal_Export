@@ -1,22 +1,21 @@
 """
-BB Unreal Export - Tools menu integration
+BB Unreal Export - Tools menu integration (engine-wide plugin copy)
 
-Copy this file into your Unreal project's Content/Python/init_unreal.py (edit
-REBUILD_SCRIPT_PATH and DEFAULT_BROWSE_DIR below first) -- Unreal auto-runs
-any init_unreal.py found under a Content/Python folder on every editor
-launch. It registers a "BB Unreal Export: Rebuild Scene" entry under the
-Tools menu that prompts for a transforms JSON file and runs
-unreal_rebuild_scene.py against it, so it never has to be typed by hand.
+This is the same init_unreal.py from the repo root, packaged as the content
+of an engine-level plugin (UnrealPlugin/BBUnrealExportTools) so it registers
+the "BB Unreal Export: Rebuild Scene" Tools menu entry automatically for
+EVERY project on this engine install, with EnabledByDefault -- no per-project
+Content/Python copy or manual exec needed.
 
-To activate it in an already-running editor without restarting, paste this
-into the Python console (Window > Developer Tools > Output Log, or the
-in-viewport ~ console):
-
-    exec(open(r"<path-to-your-project>\\Content\\Python\\init_unreal.py").read())
-
-Unreal's Python API has no native file-open dialog (unreal.EditorDialog only
-offers message boxes), so this uses tkinter -- bundled with Unreal's embedded
-Python interpreter on Windows -- to pop a real Windows file picker.
+To update this after editing the source of truth (the repo root's
+init_unreal.py), copy it here (keeping this docstring) and re-copy the whole
+BBUnrealExportTools folder to:
+    <EngineInstallDir>\\Engine\\Plugins\\Editor\\BBUnrealExportTools
+(requires admin rights -- Program Files is protected). Restart the editor to
+pick up the change; like the project-local version, editing THIS file alone
+also needs a re-exec or restart, but unreal_rebuild_scene.py itself (pointed
+at by REBUILD_SCRIPT_PATH below) is always read fresh from disk on every
+click, no reinstall needed for changes there.
 """
 
 import unreal
@@ -24,9 +23,9 @@ import os
 import tkinter as tk
 from tkinter import filedialog
 
-# ---- EDIT THESE FOR YOUR PROJECT ------------------------------------------
+# ---- EDIT THESE FOR YOUR MACHINE -------------------------------------------
 REBUILD_SCRIPT_PATH = r"I:\Addon Developpment\Github\BB_Unreal_Export\unreal_rebuild_scene.py"
-DEFAULT_BROWSE_DIR = r"J:\Perforce\20263_NAD_NAND207_N11_Equipe03\RawData\Robert"
+DEFAULT_BROWSE_DIR = ""  # left blank on purpose -- shared across every project, not one specific one
 # ---------------------------------------------------------------------------
 
 _last_browse_dir = DEFAULT_BROWSE_DIR

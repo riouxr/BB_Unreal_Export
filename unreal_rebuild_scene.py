@@ -31,6 +31,7 @@ DEFAULT_JSON_PATH = r"E:\Epic\UDS_barcelona\bb_unreal_export_transforms.json"
 DEFAULT_CONTENT_PATH = "/Game/BB_Unreal_Export"  # used only if no folder is highlighted in the Content Browser
 DEFAULT_CREATE_LEVEL_INSTANCE = True         # group the spawned actors into one Level Instance
 DEFAULT_IMPORT_MATERIALS = True              # rebuild materials against MM_Standard_01 from the JSON's recorded Blender material graph info
+DEFAULT_MODE = "full"                        # "full" | "materials_only" | "transforms_only"
 MASTER_MATERIAL_NAME = "MM_Standard_01"
 # ---------------------------------------------------------------------------
 
@@ -44,6 +45,36 @@ def _normalize_content_path(path):
     if path.startswith("/All/"):
         path = path[len("/All"):]
     return path.rstrip("/")
+
+
+# Basenames this script itself generates under CONTENT_PATH (see "Content
+# organization" in the README) -- if one of these ends up highlighted in the
+# Content Browser instead of the collection's own top-level folder, every
+# path built off CONTENT_PATH nests one level too deep (e.g. mesh lookups
+# under ".../CircularWall_Material/CircularWall_Mesh", which never exists),
+# and every single asset silently reports "not found". Confirmed live: this
+# happens in practice just from clicking into a _Material folder to check an
+# MI_ instance and then running the script again without reselecting the
+# parent folder first.
+_GENERATED_SUBFOLDER_SUFFIXES = ("_Mesh", "_Material", "_Textures")
+_GENERATED_SUBFOLDER_EXACT_NAMES = ("Materials", "Levels")
+
+
+def _avoid_generated_subfolder(path):
+    # Climb up out of a highlighted folder that looks like our own generated
+    # output (a "Materials" folder, holding shared master materials; a
+    # "Levels" folder, holding Level Instance sub-levels; or a
+    # <label>_Mesh/_Material/_Textures folder specific to one collection),
+    # since CONTENT_PATH is meant to be the collection's parent, not one of
+    # these. Loops in case more than one such level is selected.
+    while True:
+        basename = path.rsplit("/", 1)[-1]
+        if basename not in _GENERATED_SUBFOLDER_EXACT_NAMES and not any(basename.endswith(suffix) for suffix in _GENERATED_SUBFOLDER_SUFFIXES):
+            return path
+        parent = path.rsplit("/", 1)[0]
+        if not parent or parent == path:
+            return path
+        path = parent
 
 
 def _resolve_content_path():
@@ -60,8 +91,16 @@ def _resolve_content_path():
             paths = None
         if paths:
             resolved = _normalize_content_path(paths[0])
-            unreal.log(f"BB Unreal Export: importing into highlighted Content Browser folder '{resolved}'")
-            return resolved
+            corrected = _avoid_generated_subfolder(resolved)
+            if corrected != resolved:
+                unreal.log_warning(
+                    f"BB Unreal Export: highlighted folder '{resolved}' looks like one of this script's own "
+                    f"generated output folders -- using its parent '{corrected}' instead. Highlight the "
+                    "collection's own top-level folder before running, not a _Mesh/_Material/_Textures "
+                    "subfolder or the shared Materials/Levels folder."
+                )
+            unreal.log(f"BB Unreal Export: importing into highlighted Content Browser folder '{corrected}'")
+            return corrected
     unreal.log(f"BB Unreal Export: no folder highlighted in Content Browser, using default '{DEFAULT_CONTENT_PATH}'")
     return DEFAULT_CONTENT_PATH
 
@@ -74,6 +113,14 @@ JSON_PATH = globals().get("BB_JSON_PATH") or DEFAULT_JSON_PATH
 FBX_DIR = os.path.dirname(JSON_PATH)         # exported .fbx files sit next to the JSON
 CREATE_LEVEL_INSTANCE = globals().get("BB_CREATE_LEVEL_INSTANCE", DEFAULT_CREATE_LEVEL_INSTANCE)
 IMPORT_MATERIALS = globals().get("BB_IMPORT_MATERIALS", DEFAULT_IMPORT_MATERIALS)
+# "full" (import/spawn/materials/level instance, the normal rebuild) |
+# "materials_only" (reapply materials to already-imported meshes, nothing
+# else -- no FBX import, no actors touched) | "transforms_only" (move
+# already-spawned actors to match the JSON's current transforms, nothing
+# else -- no FBX import, no material changes). The latter two are for
+# iterating on a Blender-side tweak without paying for a full mesh
+# reimport/respawn/Level-Instance-rebuild every time.
+MODE = globals().get("BB_MODE", DEFAULT_MODE)
 CONTENT_PATH = _normalize_content_path(globals().get("BB_CONTENT_PATH") or _resolve_content_path())
 # The Blender add-on's "Collect Textures" button copies every material
 # texture used by the exported objects into a Textures folder right next to
@@ -584,42 +631,61 @@ def _ensure_material_instance(master, mat_name, base_color_tex, base_color_tint,
     # for meshes and loose textures, rather than trusting Python `==`
     # equality between two Texture2D object wrappers (never verified to
     # actually mean "same underlying asset" in this engine's bindings).
-    # Once created, an instance is never overwritten on a later run -- if
-    # you edit the material's color in Blender, delete the existing
-    # MI_<name>_01 asset before re-running to pick up the change, same as
-    # MM_Standard_01.
+    #
+    # The asset itself is only created once, by name -- but its parameters
+    # (parent, textures, tint, switches) are resynced from the JSON on every
+    # run whether the instance is fresh or already existed. This used to only
+    # happen on creation, which meant re-running after a Blender-side color
+    # or texture change (or using Materials Only mode, whose entire purpose
+    # is exactly that) silently did nothing on any material whose instance
+    # already existed -- confirmed live: a Base_Color_Tint change in Blender
+    # produced zero "created" log lines and zero visible change in Unreal on
+    # the next run, because the old code returned the untouched existing
+    # asset before ever looking at the new parameter values.
     name = _instance_asset_name(mat_name)
     asset_path = f"{INSTANCE_DEST_PATH}/{name}"
-    if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
-        return unreal.EditorAssetLibrary.load_asset(asset_path)
+    instance = unreal.EditorAssetLibrary.load_asset(asset_path) if unreal.EditorAssetLibrary.does_asset_exist(asset_path) else None
+    created = instance is None
 
-    factory = unreal.MaterialInstanceConstantFactoryNew()
-    instance = unreal.AssetToolsHelpers.get_asset_tools().create_asset(name, INSTANCE_DEST_PATH, unreal.MaterialInstanceConstant, factory)
-    if instance is None:
-        unreal.log_error(f"BB Unreal Export: could not create material instance '{name}'")
-        return None
+    if created:
+        factory = unreal.MaterialInstanceConstantFactoryNew()
+        instance = unreal.AssetToolsHelpers.get_asset_tools().create_asset(name, INSTANCE_DEST_PATH, unreal.MaterialInstanceConstant, factory)
+        if instance is None:
+            unreal.log_error(f"BB Unreal Export: could not create material instance '{name}'")
+            return None
 
     MEL = unreal.MaterialEditingLibrary
     # MaterialInstanceConstantFactoryNew has no settable "initial_parent"
     # property in this engine version (confirmed by a live run: "Failed to
     # find property 'initial_parent'") -- set_material_instance_parent is
-    # the documented, version-stable way to do this instead.
+    # the documented, version-stable way to do this instead. Also doubles as
+    # the fix for a stale instance left with a broken/no parent from an
+    # earlier run (e.g. one created while MM_Standard_01 itself had failed
+    # to save) -- it's now always reset to the current master, not just on
+    # first creation.
     MEL.set_material_instance_parent(instance, master)
     if base_color_tex is not None:
         MEL.set_material_instance_texture_parameter_value(instance, "Base_Color", base_color_tex)
     r, g, b, a = base_color_tint
     MEL.set_material_instance_vector_parameter_value(instance, "Base_Color_Tint", unreal.LinearColor(r, g, b, a))
+    # Only set a texture parameter when there's an actual texture to assign --
+    # passing None through to set_material_instance_texture_parameter_value
+    # has never been tested against a live editor, so this doesn't risk that
+    # call rejecting/erroring on a None value. The static switches, which
+    # only take a plain bool, ARE always (re)set either way -- that's what
+    # actually turns a stale "on" back off if a texture was removed in
+    # Blender since the instance was first created.
     if normal_tex is not None:
         MEL.set_material_instance_texture_parameter_value(instance, "Normal", normal_tex)
     if emissive_tex is not None:
         MEL.set_material_instance_texture_parameter_value(instance, "Emissive", emissive_tex)
-        MEL.set_material_instance_static_switch_parameter_value(instance, "Use Emissive Map", True)
+    MEL.set_material_instance_static_switch_parameter_value(instance, "Use Emissive Map", emissive_tex is not None)
     if orm_tex is not None:
         MEL.set_material_instance_texture_parameter_value(instance, "ORM", orm_tex)
-        MEL.set_material_instance_static_switch_parameter_value(instance, "Input ON/OFF", True)
+    MEL.set_material_instance_static_switch_parameter_value(instance, "Input ON/OFF", orm_tex is not None)
 
-    unreal.EditorAssetLibrary.save_asset(f"{INSTANCE_DEST_PATH}/{name}")
-    unreal.log(f"BB Unreal Export: created '{name}' (parent {MASTER_MATERIAL_NAME})")
+    unreal.EditorAssetLibrary.save_asset(asset_path)
+    unreal.log(f"BB Unreal Export: {'created' if created else 'updated'} '{name}' (parent {MASTER_MATERIAL_NAME})")
     return instance
 
 
@@ -715,12 +781,191 @@ def _cleanup_stale_object_actors(names):
         unreal.log(f"BB Unreal Export: removed {len(stale)} stale actor(s) left over from a previous run before rebuilding")
 
 
-def main():
-    with open(JSON_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def _load_existing_mesh(asset_name):
+    asset_name = _sanitize_asset_name(asset_name)
+    asset_path = f"{MESH_DEST_PATH}/{asset_name}"
+    if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        return unreal.EditorAssetLibrary.load_asset(asset_path)
+    return None
 
-    objects = data["objects"]
-    materials_data = data.get("materials", {})
+
+def _run_materials_only(objects, materials_data):
+    # Reapply materials to whatever's already imported under MESH_DEST_PATH --
+    # no FBX import, no actors spawned/moved, no Level Instance touched. Lets
+    # a Blender-side material/color tweak be picked up without paying for a
+    # full mesh reimport + actor respawn + Level Instance rebuild.
+    if not IMPORT_MATERIALS:
+        unreal.log_warning("BB Unreal Export: Materials Only requires Import Materials to be on -- nothing to do")
+        return
+
+    materials_applied = set()
+    updated = 0
+    missing = 0
+    for entry in objects:
+        source_fbx = entry.get("source_fbx")
+        if not source_fbx:
+            continue
+        asset_name = os.path.splitext(source_fbx)[0]
+        if asset_name in materials_applied:
+            continue
+        materials_applied.add(asset_name)
+
+        static_mesh = _load_existing_mesh(asset_name)
+        if static_mesh is None:
+            unreal.log_warning(
+                f"BB Unreal Export: no existing mesh asset for '{entry['name']}' ('{asset_name}' under "
+                f"'{MESH_DEST_PATH}') -- run a Full Rebuild first"
+            )
+            missing += 1
+            continue
+
+        _apply_materials(static_mesh, entry.get("materials", []), materials_data)
+        updated += 1
+
+    unreal.log(f"BB Unreal Export: Materials Only -- updated {updated} unique mesh(es), {missing} not found")
+
+
+def _update_actor_transforms(objects, labels, level=None):
+    # Shared by both branches of _run_transforms_only below -- assumes the
+    # actors are currently reachable via get_all_level_actors() (either
+    # because they were never grouped into a Level Instance, or because the
+    # caller just temporarily reloaded the sub-level that holds them).
+    #
+    # `level` restricts the match to actors in that one level. Needed when
+    # the sub-level is temporarily added back: the Level Instance's own
+    # loaded copy of the same level (a /Temp/... instanced package) holds
+    # actors with the exact same names, and moving those instead would
+    # change nothing on disk.
+    actors_by_name = _actors_by_export_name(labels, level)
+    updated = 0
+    missing = 0
+    for entry in objects:
+        actor = actors_by_name.get(entry["name"])
+        if actor is None:
+            unreal.log_warning(f"BB Unreal Export: no existing actor for '{entry['name']}' -- run a Full Rebuild first")
+            missing += 1
+            continue
+
+        location = blender_to_unreal_location(entry["location_m"])
+        rotation = blender_to_unreal_rotation(entry["rotation_quat_wxyz"])
+        scale = blender_to_unreal_scale(entry["scale"])
+        transform = unreal.Transform(location=location, rotation=rotation, scale=scale)
+        # set_actor_transform alone doesn't mark the actor's package dirty,
+        # so save_dirty_packages skipped the sub-level and the move was lost
+        # when it was removed from the world again (confirmed: "updated 2/2"
+        # but the level file's timestamp never changed). modify() marks it.
+        actor.modify()
+        actor.set_actor_transform(transform, False, False)
+        updated += 1
+    return updated, missing
+
+
+def _run_transforms_only(objects):
+    # Move already-spawned actors to match the JSON's current transforms --
+    # no FBX import, no material changes, no Level Instance rebuild.
+    #
+    # Once actors are grouped into a Level Instance (group_actors_into_level_
+    # instance -> _create_level_instance_from_actors), they live in their own
+    # level asset, and the Level Instance only shows an instanced copy of it
+    # (a /Temp/... package). Moving actors in that copy changes nothing on
+    # disk, and EnterEdit/ExitEdit aren't exposed to Python (not UFUNCTIONs
+    # in LevelInstanceInterface.h).
+    #
+    # Work around it the same way the Full Rebuild flow's own level-creation
+    # step does: temporarily add the level asset back into the world as a
+    # streaming level (add_level_to_world), update actors while it's loaded,
+    # save, remove it again, then reload the Level Instance so it picks up
+    # the saved transforms.
+    labels = [entry["name"] for entry in objects]
+    instance_actor = _find_existing_level_instance_actor(COLLECTION_LABEL)
+
+    if instance_actor is None:
+        # Nothing grouped into a Level Instance yet (CREATE_LEVEL_INSTANCE
+        # was off, or no Full Rebuild has run) -- actors, if any, are still
+        # directly in the persistent level and already reachable as-is.
+        _log_level_instances_for_diagnosis(COLLECTION_LABEL)
+        updated, missing = _update_actor_transforms(objects, labels)
+        unreal.log(f"BB Unreal Export: Transforms Only -- updated {updated}/{len(objects)} actor(s), {missing} not found")
+        return
+
+    level_path = _level_instance_world_path(instance_actor)
+    if level_path is None:
+        unreal.log_warning(
+            f"BB Unreal Export: Level Instance '{instance_actor.get_actor_label()}' has no level asset set (or its "
+            "level asset was deleted) -- run a Full Rebuild first"
+        )
+        return
+
+    editor_world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    level_editor = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    # add_level_to_world makes the added level the current level, and
+    # removing it falls back to the persistent level -- not necessarily
+    # what was current before (e.g. a sub-level the user spawns into).
+    previous_current_level = level_editor.get_current_level()
+
+    # A run that errors between add_level_to_world and remove_level_from_world
+    # leaves the level added to the world. Confirmed live: after the
+    # LevelStreaming-vs-Level crash, the next run's add_level_to_world popped
+    # a modal "A level with that name already exists in the world" dialog
+    # and returned None. Reuse a leftover instead of re-adding it, and remove
+    # it at the end like normal.
+    loaded_level = _find_level_in_world(editor_world, level_path)
+    if loaded_level is not None:
+        unreal.log(
+            f"BB Unreal Export: '{level_path}' was still added to the world from an earlier run -- "
+            "reusing it and removing it afterwards"
+        )
+    else:
+        streaming_level = unreal.EditorLevelUtils.add_level_to_world(editor_world, level_path, unreal.LevelStreamingAlwaysLoaded)
+        if streaming_level is None:
+            unreal.log_error(f"BB Unreal Export: could not temporarily load '{level_path}' to update its actors' transforms")
+            return
+        # add_level_to_world returns the LevelStreaming, not the Level itself --
+        # confirmed live (a first version of this passed that straight to
+        # remove_level_from_world and crashed: "Cannot nativize
+        # 'LevelStreamingAlwaysLoaded' as 'Object' (allowed Class type:
+        # 'Level')"). get_loaded_level() is the same conversion already used
+        # elsewhere in this file for create_new_streaming_level's return value.
+        loaded_level = streaming_level.get_loaded_level()
+        if loaded_level is None:
+            unreal.log_error(
+                f"BB Unreal Export: '{level_path}' was added to the world but didn't load -- remove it from the "
+                "Levels panel by hand"
+            )
+            return
+
+    try:
+        updated, missing = _update_actor_transforms(objects, labels, loaded_level)
+        unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)
+    finally:
+        unreal.EditorLevelUtils.remove_level_from_world(loaded_level)
+        if previous_current_level is not None and previous_current_level != loaded_level:
+            level_editor.set_current_level_by_name(previous_current_level.get_outer().get_name())
+
+    if updated == 0:
+        unreal.log_warning(
+            f"BB Unreal Export: none of the actors in '{level_path}' matched -- a Level Instance built before "
+            "actors were tagged with their Blender names has renamed labels (e.g. 'Suzanne2'); run a Full Rebuild once"
+        )
+    else:
+        # The Level Instance still shows the copy it loaded before this run.
+        # unload_level_instance() + load_level_instance() in the same frame
+        # cancel out (ULevelInstanceSubsystem::RequestLoadLevelInstance skips
+        # an already-loaded instance unless forced). Re-setting world_asset
+        # goes through PostEditChangeProperty -> UpdateLevelInstanceFromWorldAsset,
+        # which requests a forced reload of the just-saved level. ALWAYS is
+        # needed: the default notify mode skips PostEditChangeProperty when
+        # the value doesn't change, and here it's set to itself.
+        instance_actor.set_editor_property(
+            "world_asset",
+            instance_actor.get_editor_property("world_asset"),
+            unreal.PropertyAccessChangeNotifyMode.ALWAYS,
+        )
+
+    unreal.log(f"BB Unreal Export: Transforms Only -- updated {updated}/{len(objects)} actor(s), {missing} not found")
+
+
+def _run_full_rebuild(objects, materials_data):
     actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
 
     _cleanup_stale_object_actors([entry["name"] for entry in objects])
@@ -761,6 +1006,7 @@ def main():
                 continue
 
             actor.set_actor_label(entry["name"], mark_dirty=True)
+            _tag_with_export_name(actor, entry["name"])
             actor.set_actor_scale3d(scale)
             spawned_actors.append(actor)
         except Exception as exc:
@@ -771,6 +1017,33 @@ def main():
 
     if CREATE_LEVEL_INSTANCE and spawned_actors:
         group_actors_into_level_instance(spawned_actors)
+
+
+def main():
+    # COLLECTION_LABEL (derived from JSON_PATH's filename) is what ties a
+    # Transforms Only / Materials Only run back to a Full Rebuild's Level
+    # Instance/mesh/material paths -- if a different JSON gets picked in the
+    # file dialog (different name, or even the same collection re-exported
+    # under a new filename), every lookup silently misses instead of
+    # erroring, which is very hard to diagnose from the per-object warnings
+    # alone. Log what actually got resolved on every run.
+    unreal.log(
+        f"BB Unreal Export: mode='{MODE}' json='{JSON_PATH}' collection_label='{COLLECTION_LABEL}' "
+        f"content_path='{CONTENT_PATH}'"
+    )
+
+    with open(JSON_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    objects = data["objects"]
+    materials_data = data.get("materials", {})
+
+    if MODE == "materials_only":
+        _run_materials_only(objects, materials_data)
+    elif MODE == "transforms_only":
+        _run_transforms_only(objects)
+    else:
+        _run_full_rebuild(objects, materials_data)
 
 
 def group_actors_into_level_instance(actors):
@@ -812,11 +1085,119 @@ def _actors_by_label(labels):
     return [a for a in actor_subsystem.get_all_level_actors() if a.get_actor_label() in label_set]
 
 
-def _find_existing_level_instance_actor(label):
+# Labels don't survive grouping: move_actors_to_level copy-pastes actors
+# while the originals still exist, so the pasted copies get uniquified
+# labels ("Suzanne" -> "Suzanne2"). Confirmed by reading a saved level's
+# actor descriptors. Undoing that by stripping digits isn't safe
+# ("SM_Deco_01" -> "SM_Deco_02" collides with a real object), so each
+# spawned actor also carries its Blender name as a tag, which copy-paste
+# preserves.
+_EXPORT_NAME_TAG_PREFIX = "BBExport:"
+
+
+def _tag_with_export_name(actor, name):
+    tags = [t for t in actor.get_editor_property("tags") if not str(t).startswith(_EXPORT_NAME_TAG_PREFIX)]
+    tags.append(unreal.Name(_EXPORT_NAME_TAG_PREFIX + name))
+    actor.set_editor_property("tags", tags)
+
+
+def _export_name(actor):
+    # The Blender name from the tag, or the label for actors spawned before
+    # tagging existed (still correct as long as they were never grouped).
+    for t in actor.get_editor_property("tags"):
+        s = str(t)
+        if s.startswith(_EXPORT_NAME_TAG_PREFIX):
+            return s[len(_EXPORT_NAME_TAG_PREFIX):]
+    return actor.get_actor_label()
+
+
+def _actors_by_export_name(names, level=None):
     actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    name_set = set(names)
+    result = {}
     for a in actor_subsystem.get_all_level_actors():
-        if isinstance(a, unreal.LevelInstance) and a.get_actor_label() == label:
+        if level is not None and a.get_level() != level:
+            continue
+        name = _export_name(a)
+        if name in name_set:
+            result[name] = a
+    return result
+
+
+def _all_level_instances():
+    actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    return [a for a in actor_subsystem.get_all_level_actors() if isinstance(a, unreal.LevelInstance)]
+
+
+def _level_instance_world_path(instance_actor):
+    # Package path of the level asset a Level Instance points at, or None.
+    # Reading a soft object property from Python loads it synchronously
+    # (PyConversion uses LoadObjectPropertyValue), so None means unset or
+    # the asset no longer exists, not merely "not loaded yet".
+    world_asset = instance_actor.get_editor_property("world_asset")
+    if world_asset is None:
+        return None
+    return world_asset.get_path_name().split(".")[0]
+
+
+def _is_collection_level_path(level_path, label):
+    # True for any path _next_free_level_path hands out for this label:
+    # <CONTENT_PATH>/Levels/<label> or <label>_<n>.
+    if not level_path:
+        return False
+    base = f"{CONTENT_PATH}/Levels/{label}"
+    if level_path == base:
+        return True
+    return level_path.startswith(base + "_") and level_path[len(base) + 1:].isdigit()
+
+
+def _find_existing_level_instance_actor(label):
+    # Label first -- that's what this script names the actor it spawns.
+    # Falls back to the level asset the actor points at: a Level Instance
+    # made by dragging the level asset into the viewport doesn't necessarily
+    # carry that label. Confirmed live: the script's Level Instance was
+    # deleted and replaced by a dragged-in one, and every later Transforms
+    # Only run found nothing by label ("126 not found").
+    instances = _all_level_instances()
+    for a in instances:
+        if a.get_actor_label() == label:
             return a
+
+    by_level = [a for a in instances if _is_collection_level_path(_level_instance_world_path(a), label)]
+    if not by_level:
+        return None
+    if len(by_level) > 1:
+        names = ", ".join(a.get_actor_label() for a in by_level)
+        unreal.log_warning(
+            f"BB Unreal Export: {len(by_level)} Level Instances point at '{label}' levels ({names}) -- "
+            f"using '{by_level[0].get_actor_label()}'; delete the extras"
+        )
+    unreal.log(
+        f"BB Unreal Export: using Level Instance '{by_level[0].get_actor_label()}' for '{label}' "
+        "(matched by its level asset, not its label)"
+    )
+    return by_level[0]
+
+
+def _log_level_instances_for_diagnosis(label):
+    instances = _all_level_instances()
+    if not instances:
+        unreal.log(f"BB Unreal Export: no Level Instance for '{label}' in the level -- looking for ungrouped actors")
+        return
+    found = ", ".join(f"'{a.get_actor_label()}' -> {_level_instance_world_path(a)}" for a in instances)
+    unreal.log(
+        f"BB Unreal Export: no Level Instance labelled '{label}' or pointing at '{CONTENT_PATH}/Levels/{label}'; "
+        f"Level Instances present: {found} -- looking for ungrouped actors"
+    )
+
+
+def _find_level_in_world(world, level_path):
+    # The level from `level_path` if it's currently added to `world` as a
+    # regular sub-level. A Level Instance's own copy lives under /Temp/...,
+    # so it never matches.
+    for level in unreal.EditorLevelUtils.get_levels(world):
+        if level.get_outer().get_path_name().split(".")[0] == level_path:
+            return level
     return None
 
 
@@ -890,6 +1271,17 @@ def _create_level_instance_from_actors(actors, labels, persistent_level):
 
     unreal.log(f"BB Unreal Export: moved {total - len(remaining_labels)}/{total} actor(s) into '{new_level_path}'")
 
+    # The moved copies came back with uniquified labels (see
+    # _EXPORT_NAME_TAG_PREFIX) -- put the Blender names back so the
+    # Outliner matches Blender. The originals are gone by now.
+    relabelled = 0
+    for name, a in _actors_by_export_name(labels, loaded_level).items():
+        if a.get_actor_label() != name:
+            a.set_actor_label(name, mark_dirty=True)
+            relabelled += 1
+    if relabelled:
+        unreal.log(f"BB Unreal Export: restored the original label on {relabelled} moved actor(s)")
+
     if remaining_labels:
         names = ", ".join(sorted(remaining_labels))
         unreal.log_warning(
@@ -919,6 +1311,7 @@ def _create_level_instance_from_actors(actors, labels, persistent_level):
     instance_actor = _find_existing_level_instance_actor(label)
     if instance_actor is not None:
         instance_actor.set_editor_property("world_asset", level_world)
+        unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)
         unreal.log(f"BB Unreal Export: updated existing Level Instance '{label}' to point at '{new_level_path}' ({total} actor(s))")
         return
 
@@ -930,6 +1323,15 @@ def _create_level_instance_from_actors(actors, labels, persistent_level):
 
     instance_actor.set_editor_property("world_asset", level_world)
     instance_actor.set_actor_label(label, mark_dirty=True)
+    # The earlier save_dirty_packages call (right after moving actors into
+    # the sub-level) happens BEFORE this actor's world_asset is set -- that
+    # property change (or, in this branch, the actor's very existence) was
+    # never actually written to disk. Confirmed live: after an editor
+    # restart, the Level Instance actor itself survived (already-saved OFPA
+    # external actor package) but its world_asset came back None, because
+    # only the in-memory session ever had it set. Save again now that both
+    # are in their final state.
+    unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)
     unreal.log(f"BB Unreal Export: created Level Instance '{label}' from {total} actor(s)")
 
 
