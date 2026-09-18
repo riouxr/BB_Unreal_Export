@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 7, 5),
+    "version": (1, 8, 1),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -174,11 +174,23 @@ def _export_objects_to_fbx(context, objects, directory):
     return exported
 
 
+def _used_material_names(obj):
+    """Material slots actually referenced by a face, in slot order -- matches what
+    Blender's FBX exporter writes out (it drops slots with no assigned polygons),
+    unlike the raw obj.material_slots list which includes unused leftover slots."""
+    used_indices = {poly.material_index for poly in obj.data.polygons}
+    return [
+        obj.material_slots[i].material.name
+        for i in sorted(used_indices)
+        if 0 <= i < len(obj.material_slots) and obj.material_slots[i].material
+    ]
+
+
 def _write_transforms_json(objects, filepath):
     entries = []
     for obj in objects:
         loc, rot, scale = obj.matrix_world.decompose()
-        materials = [slot.material.name for slot in obj.material_slots if slot.material] if obj.type == 'MESH' else []
+        materials = _used_material_names(obj) if obj.type == 'MESH' else []
         entries.append({
             "name": obj.name,
             "source_fbx": _source_fbx_name(obj),
@@ -260,7 +272,7 @@ class BBUNREALEXPORT_OT_export_fbx(bpy.types.Operator):
 
 class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
     bl_idname = "bb_unreal_export.export_transforms"
-    bl_label = "Export Geo Transforms"
+    bl_label = "Export XYZ and Materials"
     bl_description = (
         "Write a JSON file with the world transform of every selected object "
         "and the source FBX each one should be instanced from"
@@ -407,6 +419,27 @@ def _upstream_image(socket, skip_separate_color=False, visited=None):
     return None
 
 
+def _resolve_flat_color(socket, visited=None):
+    # A Color input's default_value only reflects the live value while the
+    # socket is unlinked -- once something feeds it, Blender freezes
+    # default_value at whatever it last was, so it silently goes stale as
+    # soon as an upstream node's own color changes. If the socket is fed by
+    # an Ambient Occlusion node (a common way to plug a flat color into Base
+    # Color while still getting AO shading in the 3D viewport), follow
+    # through to that node's own Color input instead, which IS the value the
+    # artist is actually editing.
+    if socket is None:
+        return [0.8, 0.8, 0.8, 1.0]
+    if visited is None:
+        visited = set()
+    if socket.is_linked and socket not in visited:
+        visited.add(socket)
+        node = socket.links[0].from_node
+        if node.type == 'AMBIENT_OCCLUSION':
+            return _resolve_flat_color(node.inputs.get('Color'), visited)
+    return list(socket.default_value)
+
+
 def _find_principled_bsdf(mat):
     if mat is None or mat.node_tree is None:
         return None
@@ -460,8 +493,7 @@ def _material_texture_info(mat, warnings):
     # in. Recorded so a material with no Base Color texture still shows its
     # real flat color in Unreal (as Base_Color_Tint) instead of either
     # nothing or MM_Standard_01's own checker-pattern debug placeholder.
-    base_color_socket = bsdf.inputs.get('Base Color')
-    base_color_value = list(base_color_socket.default_value) if base_color_socket else [0.8, 0.8, 0.8, 1.0]
+    base_color_value = _resolve_flat_color(bsdf.inputs.get('Base Color'))
 
     return {
         "base_color": resolve("base_color", base_color_img),
@@ -742,7 +774,7 @@ class BBUNREALEXPORT_PT_panel(bpy.types.Panel):
 
         col2 = layout.column(align=True)
         col2.operator("bb_unreal_export.export_fbx", text="Export FBX Only", icon='EXPORT')
-        col2.operator("bb_unreal_export.export_transforms", text="Export Geo Transforms Only", icon='FILE')
+        col2.operator("bb_unreal_export.export_transforms", text="Export XYZ and Materials", icon='FILE')
 
         layout.operator("bb_unreal_export.collect_textures", text="Collect Textures", icon='TEXTURE')
 
