@@ -94,6 +94,19 @@ being merged into the wrong mesh. Renumbering a duplicate never picks a
 number already used by anything else in the file, even a different,
 unrelated duplicate pair sitting at an adjacent number.
 
+Adds the `SM_` prefix to any mesh object that doesn't have one (case-insensitive,
+so `sm_foo` is left alone; non-mesh objects are never touched). This happens
+first, so duplicate grouping works on the final names. If `SM_<name>` is
+already taken by a different object, that object is left as-is and reported
+rather than silently getting a `.001` suffix.
+
+Gives any mesh with no trailing number a `_01` (`SM_foo` -> `SM_foo_01`;
+`SM_foo` and `SM_foo.001` -> `SM_foo_01` and `SM_foo_01.001`, which the
+renumbering below then turns into `_01`, `_02`). The number is chosen so it
+can't collide with anything already in the file: if `SM_foo_01` already
+belongs to a different part, the next free number is used instead
+(`SM_foo_02`, ...) rather than merging into it.
+
 Also resets a material's Base Color to white wherever something's connected
 to it (a texture, or routed through an Ambient Occlusion node) — that socket
 freezes at whatever value it had before linking, so a stale/leftover color

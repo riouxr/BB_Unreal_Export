@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 11, 2),
+    "version": (1, 12, 1),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -37,6 +37,32 @@ from mathutils import Matrix
 def _sanitize_filename(name):
     cleaned = re.sub(r'[^\w\-. ]', '_', name).strip()
     return cleaned or "Unnamed"
+
+
+def _directory_problem(directory):
+    # Checks the Export Directory up front (creating it if it's missing) and
+    # returns a plain-language reason it can't be used, or None if it's fine.
+    # Without this, an unavailable drive (e.g. a disconnected J:) surfaced as
+    # a raw "FileNotFoundError: [WinError 3] ... 'J:\\'" traceback from deep
+    # inside os.makedirs, after the selection had already been altered.
+    drive, _ = os.path.splitdrive(directory)
+    if drive and not os.path.exists(drive + os.sep):
+        return (
+            f"Export Directory is on {drive}, which isn't available right now "
+            f"(disconnected, offline, or not mounted). Reconnect it or choose "
+            f"a different Export Directory. ({directory})"
+        )
+    if os.path.exists(directory) and not os.path.isdir(directory):
+        return f"Export Directory is a file, not a folder: {directory}"
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except PermissionError:
+        return f"No permission to create the Export Directory: {directory}"
+    except OSError as exc:
+        return f"Can't create the Export Directory ({exc.strerror or exc}): {directory}"
+    if not os.access(directory, os.W_OK):
+        return f"Export Directory isn't writable (read-only or no permission): {directory}"
+    return None
 
 
 def _mirror_sign_pattern(scale):
@@ -326,6 +352,10 @@ class BBUNREALEXPORT_OT_export_fbx(bpy.types.Operator):
         if not directory:
             self.report({'WARNING'}, "Set an export directory first")
             return {'CANCELLED'}
+        problem = _directory_problem(directory)
+        if problem:
+            self.report({'ERROR'}, problem)
+            return {'CANCELLED'}
 
         targets = _export_targets(context)
         if context.scene.bb_unreal_export_per_collection and not targets:
@@ -378,6 +408,10 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
         directory = bpy.path.abspath(context.scene.bb_unreal_export_directory)
         if not directory:
             self.report({'WARNING'}, "Set an export directory first")
+            return {'CANCELLED'}
+        problem = _directory_problem(directory)
+        if problem:
+            self.report({'ERROR'}, problem)
             return {'CANCELLED'}
 
         targets = _export_targets(context)
@@ -631,6 +665,10 @@ class BBUNREALEXPORT_OT_collect_textures(bpy.types.Operator):
         if not directory:
             self.report({'WARNING'}, "Set an export directory first")
             return {'CANCELLED'}
+        problem = _directory_problem(directory)
+        if problem:
+            self.report({'ERROR'}, problem)
+            return {'CANCELLED'}
 
         targets = _export_targets(context)
         per_collection = context.scene.bb_unreal_export_per_collection
@@ -682,6 +720,10 @@ class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
         directory = bpy.path.abspath(context.scene.bb_unreal_export_directory)
         if not directory:
             self.report({'WARNING'}, "Set an export directory first")
+            return {'CANCELLED'}
+        problem = _directory_problem(directory)
+        if problem:
+            self.report({'ERROR'}, problem)
             return {'CANCELLED'}
 
         # Captured once, up front, before any object-selection churn from the
@@ -935,6 +977,72 @@ def _relink_copies_as_instances(subgroups):
     return relinked
 
 
+def _add_sm_prefix(objects):
+    # Unreal static meshes are conventionally named SM_*, and the FBX/asset
+    # names are derived from the Blender object names, so give any mesh
+    # object without the prefix one. Only mesh objects (empties, cameras,
+    # lights aren't exported as static meshes); the check is case-insensitive
+    # so an existing "sm_" isn't turned into "SM_sm_". Prepending keeps any
+    # ".001" suffix, so duplicate chains stay intact for the renumber step.
+    # If "SM_<name>" is already taken by a different object, leave that one
+    # alone and report it rather than letting Blender silently append ".001".
+    used = {o.name for o in bpy.data.objects}
+    renamed = 0
+    conflicts = []
+    for obj in objects:
+        if obj.type != 'MESH' or obj.name.lower().startswith("sm_"):
+            continue
+        new_name = "SM_" + obj.name
+        if new_name in used:
+            conflicts.append(obj.name)
+            continue
+        used.discard(obj.name)
+        obj.name = new_name
+        used.add(new_name)
+        renamed += 1
+    return renamed, conflicts
+
+
+def _add_default_suffix(objects):
+    # Give mesh objects with no trailing number a "_01". Objects sharing the
+    # same base name (foo and foo.001, i.e. Blender duplicates of an unnumbered
+    # name) get the SAME number with their ".NNN" kept -- foo_01 and
+    # foo_01.001 -- so the renumber step that runs next turns them into the
+    # normal foo_01, foo_02 chain and relinks true duplicates.
+    #
+    # The number is picked so it can't collide with anything already in the
+    # file: if "foo_01" (or "foo_01.001", etc.) already belongs to some other
+    # object -- a genuinely different part with a similar name -- this uses the
+    # next free number instead (foo_02, ...) rather than merging into it or
+    # letting Blender silently append ".001". Checked against every object
+    # name in the file, not just the ones passed in.
+    existing_cores = {_split_base_and_number(o.name)[0] + (_split_base_and_number(o.name)[1] or "")
+                      for o in bpy.data.objects}
+    groups = {}
+    for obj in objects:
+        if obj.type != 'MESH':
+            continue
+        core, digits, blend_suffix = _split_base_and_number(obj.name)
+        if digits is not None:
+            continue
+        groups.setdefault(core, []).append((obj, blend_suffix))
+
+    renamed = 0
+    for core, members in groups.items():
+        n = 1
+        while f"{core}_{n:02d}" in existing_cores:
+            n += 1
+        base = f"{core}_{n:02d}"
+        existing_cores.add(base)
+        members.sort(key=lambda m: (0, 0) if m[1] is None else (1, m[1]))
+        for i, (obj, blend_suffix) in enumerate(members):
+            # The lowest member always gets the plain name, even if it was
+            # itself "foo.001" with no plain "foo" in the selection.
+            obj.name = base if i == 0 or blend_suffix is None else f"{base}.{blend_suffix:03d}"
+            renamed += 1
+    return renamed
+
+
 def _whiten_connected_base_colors(objects):
     # A material's Base Color socket only reflects a *live* value while
     # nothing is plugged into it -- once something is connected (an image
@@ -972,7 +1080,7 @@ class BBUNREALEXPORT_OT_cleanup(bpy.types.Operator):
     bl_idname = "bb_unreal_export.cleanup"
     bl_label = "Cleanup"
     bl_description = (
-        "Renumber duplicates (foo_01.001 -> foo_02, ...) -- checking mesh "
+        "Add the SM_ prefix and a _01 suffix to any mesh object missing them, then renumber duplicates (foo_01.001 -> foo_02, ...) -- checking mesh "
         "geometry first, so different meshes that happen to share a name "
         "pattern are split into their own group (foo_A_01, foo_B_01, ...) "
         "instead of being merged -- then relinks true duplicates to share "
@@ -999,20 +1107,30 @@ class BBUNREALEXPORT_OT_cleanup(bpy.types.Operator):
             self.report({'WARNING'}, "Scene has no objects")
             return {'CANCELLED'}
 
+        # Prefix first, so duplicate grouping/renumbering below works on the
+        # final names.
+        prefixed, prefix_conflicts = _add_sm_prefix(all_objects)
+        suffixed = _add_default_suffix(all_objects)
         total_renamed, total_skipped, renamed_subgroups = _renumber_objects(all_objects)
         total_relinked = _relink_copies_as_instances(renamed_subgroups)
         whitened = _whiten_connected_base_colors(all_objects)
 
-        if total_renamed == 0 and total_skipped == len(all_objects) and whitened == 0:
+        if total_renamed == 0 and total_skipped == len(all_objects) and whitened == 0 and prefixed == 0 and suffixed == 0 and not prefix_conflicts:
             self.report({'WARNING'}, "No numbered base names found, and no Base Color needed resetting")
             return {'CANCELLED'}
 
         message = f"Renumbered {total_renamed} object(s), relinked {total_relinked} cop{'y' if total_relinked == 1 else 'ies'} to shared mesh data"
+        if prefixed:
+            message += f", added SM_ prefix to {prefixed} mesh{'es' if prefixed != 1 else ''}"
+        if suffixed:
+            message += f", added _01 to {suffixed} unnumbered mesh{'es' if suffixed != 1 else ''}"
+        if prefix_conflicts:
+            message += f", couldn't add SM_ to {len(prefix_conflicts)} (name already taken: {', '.join(prefix_conflicts[:3])}{'...' if len(prefix_conflicts) > 3 else ''})"
         if total_skipped:
             message += f", skipped {total_skipped} with no trailing number"
         if whitened:
             message += f", reset Base Color to white on {whitened} material{'s' if whitened != 1 else ''}"
-        self.report({'INFO'}, message)
+        self.report({'WARNING'} if prefix_conflicts else {'INFO'}, message)
         return {'FINISHED'}
 
 
