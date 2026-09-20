@@ -198,8 +198,12 @@ def _sanitize_asset_name(name):
 def import_fbx(fbx_path, destination_path, asset_name):
     asset_name = _sanitize_asset_name(asset_name)
     asset_path = f"{destination_path}/{asset_name}"
-    if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
-        return unreal.EditorAssetLibrary.load_asset(asset_path)
+    # An existing mesh used to be returned untouched, so geometry, UV and
+    # per-polygon material changes made in Blender never reached Unreal on a
+    # rebuild (confirmed: only the material instances refreshed). It is now
+    # reimported over the existing asset (replace_existing) -- same asset
+    # path, so actors and slot assignments keep pointing at it.
+    existing = unreal.EditorAssetLibrary.does_asset_exist(asset_path)
 
     options = unreal.FbxImportUI()
     options.import_mesh = True
@@ -223,10 +227,13 @@ def import_fbx(fbx_path, destination_path, asset_name):
     task.destination_name = asset_name
     task.automated = True
     task.save = True
-    task.replace_existing = False
+    task.replace_existing = existing
+    task.replace_existing_settings = existing
     task.options = options
 
     unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    if existing:
+        unreal.log(f"BB Unreal Export: reimported existing mesh '{asset_name}' from '{fbx_path}'")
 
     static_mesh = None
     imported_paths = task.get_editor_property("imported_object_paths")
@@ -586,11 +593,26 @@ def _ensure_master_material():
     return material
 
 
+def _find_asset_by_name_anywhere(class_path, asset_name):
+    # Project-wide lookup by class + name, so an asset that already exists in
+    # another folder (a different collection's _Textures/_Material, or one
+    # moved by hand) is reused instead of duplicated next to the new mesh.
+    registry = unreal.AssetRegistryHelpers.get_asset_registry()
+    for asset_data in registry.get_assets_by_class(class_path):
+        if str(asset_data.asset_name) == asset_name and str(asset_data.package_name).startswith("/Game"):
+            return asset_data.get_asset()
+    return None
+
+
 def _import_loose_texture(file_path, destination_path, asset_name):
     asset_name = _sanitize_asset_name(asset_name)
     asset_path = f"{destination_path}/{asset_name}"
     if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
         return unreal.EditorAssetLibrary.load_asset(asset_path)
+    existing = _find_asset_by_name_anywhere(unreal.TopLevelAssetPath("/Script/Engine", "Texture2D"), asset_name)
+    if existing is not None:
+        unreal.log(f"BB Unreal Export: texture '{asset_name}' already exists at '{existing.get_path_name()}', reusing it")
+        return existing
 
     task = unreal.AssetImportTask()
     task.filename = file_path
@@ -750,6 +772,11 @@ def _ensure_material_instance(master, mat_name, base_color_tex, base_color_tint,
     name = _instance_asset_name(mat_name)
     asset_path = f"{INSTANCE_DEST_PATH}/{name}"
     instance = unreal.EditorAssetLibrary.load_asset(asset_path) if unreal.EditorAssetLibrary.does_asset_exist(asset_path) else None
+    if instance is None:
+        instance = _find_asset_by_name_anywhere(unreal.TopLevelAssetPath("/Script/Engine", "MaterialInstanceConstant"), name)
+        if instance is not None:
+            asset_path = instance.get_path_name().split(".")[0]
+            unreal.log(f"BB Unreal Export: material instance '{name}' already exists at '{asset_path}', reusing it")
     created = instance is None
 
     if created:
@@ -988,7 +1015,14 @@ def _run_transforms_only(objects):
     labels = [entry["name"] for entry in objects]
     instance_actor = _find_existing_level_instance_actor(COLLECTION_LABEL)
 
-    if instance_actor is None:
+    fixed_level_path = f"{CONTENT_PATH}/Levels/{COLLECTION_LABEL}"
+    if instance_actor is None and unreal.EditorAssetLibrary.does_asset_exist(fixed_level_path):
+        # The instance isn't visible (nested in another level / Level
+        # Instance) but the level asset is at its fixed path, and that's all
+        # that's needed -- no instance lookup, nothing to open.
+        _log_level_instances_for_diagnosis(COLLECTION_LABEL)
+        level_path = fixed_level_path
+    elif instance_actor is None:
         # Nothing grouped into a Level Instance yet (CREATE_LEVEL_INSTANCE
         # was off, or no Full Rebuild has run) -- actors, if any, are still
         # directly in the persistent level and already reachable as-is.
@@ -996,8 +1030,9 @@ def _run_transforms_only(objects):
         updated, missing = _update_actor_transforms(objects, labels)
         unreal.log(f"BB Unreal Export: Transforms Only -- updated {updated}/{len(objects)} actor(s), {missing} not found")
         return
+    else:
+        level_path = _level_instance_world_path(instance_actor)
 
-    level_path = _level_instance_world_path(instance_actor)
     if level_path is None:
         unreal.log_warning(
             f"BB Unreal Export: Level Instance '{instance_actor.get_actor_label()}' has no level asset set (or its "
@@ -1056,7 +1091,7 @@ def _run_transforms_only(objects):
             f"BB Unreal Export: none of the actors in '{level_path}' matched -- a Level Instance built before "
             "actors were tagged with their Blender names has renamed labels (e.g. 'Suzanne2'); run a Full Rebuild once"
         )
-    else:
+    elif instance_actor is not None:
         # The Level Instance still shows the copy it loaded before this run.
         # unload_level_instance() + load_level_instance() in the same frame
         # cancel out (ULevelInstanceSubsystem::RequestLoadLevelInstance skips
@@ -1250,8 +1285,8 @@ def _level_instance_world_path(instance_actor):
 
 
 def _is_collection_level_path(level_path, label):
-    # True for any path _next_free_level_path hands out for this label:
-    # <CONTENT_PATH>/Levels/<label> or <label>_<n>.
+    # True for <CONTENT_PATH>/Levels/<label>, or <label>_<n> (the numbered
+    # paths older runs created before levels were updated in place).
     if not level_path:
         return False
     base = f"{CONTENT_PATH}/Levels/{label}"
@@ -1310,49 +1345,78 @@ def _find_level_in_world(world, level_path):
     return None
 
 
-def _next_free_level_path(label):
-    # Deleting/recreating the same path in one script run is unreliable (see
-    # the long comment in _create_level_instance_from_actors below) -- so
-    # instead of ever colliding with a previous run's level asset, just pick
-    # a path that's free. This does mean old numbered level assets pile up
-    # under CONTENT_PATH/Levels/ across repeated rebuilds while iterating;
-    # that's an intentional tradeoff for correctness, clean them up by hand
-    # in the Content Browser once you're happy with a final result.
-    base = f"{CONTENT_PATH}/Levels/{label}"
-    if not unreal.EditorAssetLibrary.does_asset_exist(base):
-        return base
-    n = 2
-    while unreal.EditorAssetLibrary.does_asset_exist(f"{base}_{n}"):
-        n += 1
-    return f"{base}_{n}"
-
-
 def _create_level_instance_from_actors(actors, labels, persistent_level):
     label = COLLECTION_LABEL
 
-    # Earlier versions of this script tried to delete the previous run's
-    # Level asset and respawn the LevelInstance actor from scratch. That's
-    # fundamentally unreliable: deleting an asset requires nothing still
-    # references it, but the LevelInstance actor that *was* referencing it
-    # only gets destroyed a few lines earlier in the same synchronous script
-    # run -- and Unreal doesn't release that reference until an actual engine
-    # tick/GC pass runs, which never happens mid-script (nothing ticks between
-    # Python statements in one exec() call). So the delete would silently
-    # fail every single time, not just sometimes, and the script fell back to
-    # "just select the actors" with no Level Instance created or updated at
-    # all. Fix: never delete anything. Always build the new sub-level at a
-    # fresh, never-colliding path, then either retarget an existing
-    # LevelInstance actor's world_asset to point at it, or spawn a new one if
-    # none exists yet. Nothing here depends on a destroy having "settled".
-    new_level_path = _next_free_level_path(label)
+    # The level asset lives at ONE fixed path per collection
+    # (<CONTENT_PATH>/Levels/<label>) and is updated in place on every run --
+    # nothing is deleted or recreated. Earlier versions built each run at a
+    # fresh numbered path (Entrance, Entrance_2, ...) and repointed the Level
+    # Instance actor at it. That only works if the actor can be found, and an
+    # actor that lives inside another level (or inside another Level Instance,
+    # e.g. LI_Building_01) isn't visible to get_all_level_actors() unless that
+    # level is open for editing -- so the run couldn't find it, spawned a
+    # duplicate instance, and left the real one pointing at the stale level.
+    # Updating the asset itself means EVERY instance of it, wherever it lives,
+    # shows the new content the next time its level loads, with no need to
+    # find or open anything. (Deleting/recreating the same asset path within
+    # one run stays off the table -- the instance's reference doesn't release
+    # until an engine tick -- but emptying and refilling a loaded level is
+    # what Transforms Only already does.)
+    new_level_path = f"{CONTENT_PATH}/Levels/{label}"
+    update_in_place = unreal.EditorAssetLibrary.does_asset_exist(new_level_path)
 
-    streaming_level = unreal.EditorLevelUtils.create_new_streaming_level(
-        unreal.LevelStreamingAlwaysLoaded, new_level_path, False
-    )
-    if streaming_level is None:
-        raise RuntimeError(f"create_new_streaming_level returned None for '{new_level_path}'")
+    editor_world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    level_editor = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    previous_current_level = level_editor.get_current_level()
 
-    loaded_level = streaming_level.get_loaded_level()
+    if update_in_place and editor_world.get_path_name().split(".")[0] == new_level_path:
+        # The level being rebuilt is itself the open map (opened directly to
+        # edit it). The parts were just spawned into it and last run's were
+        # already cleared, so it already matches the JSON -- it can't also be
+        # added to itself as a sub-level ("A level with that name already
+        # exists in the world"), so just save it.
+        unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)
+        unreal.log(
+            f"BB Unreal Export: '{new_level_path}' is the open level, so the {len(labels)} part(s) were rebuilt "
+            "directly in it and saved. Instances of it elsewhere update when their level reloads."
+        )
+        return
+
+    if update_in_place:
+        leftover = _find_level_in_world(editor_world, new_level_path)
+        if leftover is not None:
+            # Left added to the world by an earlier run that errored; can't
+            # be re-added without a modal "already exists" dialog.
+            unreal.EditorLevelUtils.remove_level_from_world(leftover)
+        streaming_level = unreal.EditorLevelUtils.add_level_to_world(
+            editor_world, new_level_path, unreal.LevelStreamingAlwaysLoaded
+        )
+        if streaming_level is None:
+            raise RuntimeError(f"could not load the existing level '{new_level_path}' to update it")
+        loaded_level = streaming_level.get_loaded_level()
+        if loaded_level is None:
+            raise RuntimeError(f"'{new_level_path}' was added to the world but didn't load")
+
+        # Clear out the previous run's parts so the level ends up matching
+        # the JSON exactly (a part deleted or renamed in Blender must
+        # disappear too, not just get added to). Only StaticMeshActors --
+        # anything else someone placed in that level is left alone.
+        actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+        stale = [
+            a for a in actor_subsystem.get_all_level_actors()
+            if a.get_level() == loaded_level and type(a) == unreal.StaticMeshActor
+        ]
+        for a in stale:
+            actor_subsystem.destroy_actor(a)
+        unreal.log(f"BB Unreal Export: updating existing level '{new_level_path}' in place (cleared {len(stale)} old part(s))")
+    else:
+        streaming_level = unreal.EditorLevelUtils.create_new_streaming_level(
+            unreal.LevelStreamingAlwaysLoaded, new_level_path, False
+        )
+        if streaming_level is None:
+            raise RuntimeError(f"create_new_streaming_level returned None for '{new_level_path}'")
+        loaded_level = streaming_level.get_loaded_level()
 
     # move_actors_to_level can leave some newly-spawned actors behind on the
     # first call (observed to succeed on a second attempt -- likely the
@@ -1405,10 +1469,15 @@ def _create_level_instance_from_actors(actors, labels, persistent_level):
 
     unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)
     unreal.EditorLevelUtils.remove_level_from_world(loaded_level)
+    if previous_current_level is not None and previous_current_level != loaded_level:
+        try:
+            level_editor.set_current_level_by_name(previous_current_level.get_outer().get_name())
+        except Exception:
+            pass
 
     level_world = unreal.EditorAssetLibrary.load_asset(new_level_path)
     if level_world is None:
-        raise RuntimeError(f"could not load new level asset at '{new_level_path}' after creation")
+        raise RuntimeError(f"could not load level asset at '{new_level_path}' after building it")
 
     actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
 
@@ -1419,11 +1488,34 @@ def _create_level_instance_from_actors(actors, labels, persistent_level):
     # entirely, since nothing here is deleted.
     instance_actor = _find_existing_level_instance_actor(label)
     if instance_actor is not None:
-        instance_actor.set_editor_property("world_asset", level_world)
+        if _level_instance_world_path(instance_actor) != new_level_path:
+            instance_actor.set_editor_property("world_asset", level_world)
+        else:
+            # Same asset, new content: re-setting it to itself with ALWAYS
+            # notify forces the instance to reload the just-saved level (see
+            # _run_transforms_only).
+            instance_actor.set_editor_property(
+                "world_asset", level_world, unreal.PropertyAccessChangeNotifyMode.ALWAYS
+            )
         unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, False)
-        unreal.log(f"BB Unreal Export: updated existing Level Instance '{label}' to point at '{new_level_path}' ({total} actor(s))")
+        unreal.log(f"BB Unreal Export: updated existing Level Instance '{label}' -> '{new_level_path}' ({total} actor(s))")
         return
 
+    if update_in_place:
+        # The level asset already existed, so an instance of it almost
+        # certainly does too -- just not in a level that's loaded right now
+        # (e.g. nested inside another Level Instance). It picks up the new
+        # content the next time its level loads. Spawning another instance
+        # here would only create a duplicate, which is what used to happen.
+        _log_level_instances_for_diagnosis(label)
+        unreal.log(
+            f"BB Unreal Export: updated '{new_level_path}' in place ({total} actor(s)). No Level Instance for "
+            f"'{label}' is visible in the open level(s), so none was created -- any existing instance of that "
+            "level updates when its level is reloaded. If nothing points at it yet, drag the level into the scene."
+        )
+        return
+
+    _log_level_instances_for_diagnosis(label)
     instance_actor = actor_subsystem.spawn_actor_from_class(
         unreal.LevelInstance, unreal.Vector(0.0, 0.0, 0.0), unreal.Rotator(0.0, 0.0, 0.0)
     )

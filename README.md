@@ -253,6 +253,21 @@ origin pointing at that asset. If any step fails, it automatically falls back
 to just selecting the spawned actors so you can finish with one right-click
 (Outliner/Viewport > right-click > Level > Create Level Instance).
 
+**Re-running updates the level in place.** Each collection's level asset lives
+at one fixed path, `<CONTENT_PATH>/Levels/<Collection>`. A later run doesn't
+create a new numbered level or a new instance: it loads that existing level,
+clears the old parts out of it, fills it with the current ones, and saves.
+Every Level Instance of that level then shows the new content the next time
+its level loads, **wherever the instance lives** -- including nested inside
+another Level Instance (e.g. an `LI_Building` level), which the script can't
+see or open from Python. You don't have to open the level containing the
+instance. If the instance *is* visible in the open level it's refreshed
+immediately; if not, the log lists the Level Instances it can see and says
+that no new one was created. (Older versions built each run at a fresh
+`Name_2`, `Name_3`... path and repointed the instance, which created a
+duplicate instance whenever the real one wasn't visible. Leftover numbered
+levels and duplicate instances from those runs can be deleted by hand.)
+
 ### Material reconnection
 
 When **Import materials** is on, `import_fbx` skips Unreal's own FBX
@@ -270,7 +285,9 @@ missing textures) and instead rebuilds materials straight from the JSON's
   tested live).
 - For each unique Blender material referenced by an object's material
   slots, an instance named `MI_<BlenderMaterialName>_01` is created once (by
-  name -- the asset itself is never deleted/recreated on a later run) and
+  name -- the asset itself is never deleted/recreated on a later run; if an
+  instance or texture of that name already exists anywhere under `/Game`,
+  e.g. from another collection, it is reused instead of duplicated) and
   reused for every part that uses it (matching how the old native FBX
   material import worked -- one asset per material, shared across parts),
   with `Base_Color`/`Normal`/`ORM`/`Emissive` set from the JSON's recorded

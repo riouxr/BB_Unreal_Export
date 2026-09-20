@@ -18,7 +18,7 @@
 bl_info = {
     "name": "BB Unreal Export",
     "author": "Blender Bob",
-    "version": (1, 12, 1),
+    "version": (1, 13, 0),
     "blender": (4, 5, 0),
     "location": "View3D > N Panel > Tool",
     "description": "Export selected objects as origin-centered FBX files, plus a JSON of their world transforms, for rebuilding the scene in Unreal",
@@ -63,6 +63,60 @@ def _directory_problem(directory):
     if not os.access(directory, os.W_OK):
         return f"Export Directory isn't writable (read-only or no permission): {directory}"
     return None
+
+
+def _locked_outputs(context, targets, directory, fbx, json_out):
+    # Existing files this export is about to overwrite that are read-only.
+    # In a Perforce workspace that's every synced file that isn't checked
+    # out, so the write fails with a bare "PermissionError: [Errno 13]" -- and
+    # only after part of the export has already been written. Checked up
+    # front so nothing is written until they're all sorted out.
+    locked = []
+    for subfolder, objects in targets:
+        if not objects:
+            continue
+        target_dir = os.path.join(directory, _sanitize_filename(subfolder)) if subfolder else directory
+        paths = []
+        if fbx:
+            for _key, members in _group_by_export_key(objects):
+                paths.append(os.path.join(target_dir, _sanitize_filename(members[0].name) + ".fbx"))
+        if json_out:
+            paths.append(os.path.join(target_dir, _json_filename(context, subfolder)))
+        locked += [p for p in paths if os.path.exists(p) and not os.access(p, os.W_OK)]
+    return locked
+
+
+def _locked_message(locked):
+    names = ", ".join(os.path.basename(p) for p in locked[:6]) + ("..." if len(locked) > 6 else "")
+    return (
+        f"{len(locked)} file(s) to overwrite are read-only ({names}). If this folder is under Perforce they need "
+        "to be checked out first; otherwise clear the read-only flag. Nothing was exported."
+    )
+
+
+def _unexportable_objects(targets):
+    # Objects the FBX exporter can't see. It only exports objects that are
+    # selected, and Blender won't select an object that's hidden in the
+    # viewport, whose collection is hidden or excluded, or that's
+    # unselectable -- select_set() just silently does nothing. The exporter
+    # then writes a valid but EMPTY .fbx (4 KB, no geometry) with no error,
+    # while the JSON still lists the part. Unreal reports "nothing to
+    # import" for every one of those files. Confirmed live: 25 of 27 FBX in a
+    # collection came out empty this way.
+    bad = []
+    for _subfolder, objects in targets:
+        for obj in objects:
+            if obj.type == 'MESH' and (not obj.visible_get() or obj.hide_select):
+                bad.append(obj.name)
+    return bad
+
+
+def _unexportable_message(names):
+    shown = ", ".join(names[:6]) + ("..." if len(names) > 6 else "")
+    return (
+        f"{len(names)} object(s) can't be exported because they're hidden, in a hidden/excluded collection, or "
+        f"unselectable ({shown}) -- the FBX would come out empty. Unhide them and try again. Nothing was exported."
+    )
 
 
 def _mirror_sign_pattern(scale):
@@ -361,6 +415,14 @@ class BBUNREALEXPORT_OT_export_fbx(bpy.types.Operator):
         if context.scene.bb_unreal_export_per_collection and not targets:
             self.report({'WARNING'}, "No collections selected in the Outliner")
             return {'CANCELLED'}
+        locked = _locked_outputs(context, targets, directory, fbx=True, json_out=False)
+        if locked:
+            self.report({'ERROR'}, _locked_message(locked))
+            return {'CANCELLED'}
+        hidden = _unexportable_objects(targets)
+        if hidden:
+            self.report({'ERROR'}, _unexportable_message(hidden))
+            return {'CANCELLED'}
 
         view_layer = context.view_layer
         original_active = view_layer.objects.active
@@ -417,6 +479,10 @@ class BBUNREALEXPORT_OT_export_transforms(bpy.types.Operator):
         targets = _export_targets(context)
         if context.scene.bb_unreal_export_per_collection and not targets:
             self.report({'WARNING'}, "No collections selected in the Outliner")
+            return {'CANCELLED'}
+        locked = _locked_outputs(context, targets, directory, fbx=False, json_out=True)
+        if locked:
+            self.report({'ERROR'}, _locked_message(locked))
             return {'CANCELLED'}
 
         total_entries = 0
@@ -732,6 +798,14 @@ class BBUNREALEXPORT_OT_export_all(bpy.types.Operator):
         per_collection = context.scene.bb_unreal_export_per_collection
         if per_collection and not targets:
             self.report({'WARNING'}, "No collections selected in the Outliner")
+            return {'CANCELLED'}
+        locked = _locked_outputs(context, targets, directory, fbx=True, json_out=True)
+        if locked:
+            self.report({'ERROR'}, _locked_message(locked))
+            return {'CANCELLED'}
+        hidden = _unexportable_objects(targets)
+        if hidden:
+            self.report({'ERROR'}, _unexportable_message(hidden))
             return {'CANCELLED'}
 
         view_layer = context.view_layer
