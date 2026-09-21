@@ -236,6 +236,18 @@ collection's rebuilt output separate under `CONTENT_PATH`:
   shared project-wide (see `_find_master_material_anywhere`), so it always
   lives here regardless of which collection triggered building it
 
+**Shared Materials** (checkbox in the rebuild dialog, on by default): instead
+of the per-collection `_Material`/`_Textures` folders above, every
+collection's `MI_*` instances go into one `Instances` folder and its textures
+into one `Textures` folder, next to `MM_Standard_01`. The folder is found by
+scanning the project for the master material (falling back to
+`CONTENT_PATH/Materials` when none exists yet), so collections that share a
+Blender material share one instance. Turn it off to keep the per-collection
+folders. Instances/textures that already exist under another folder are
+reused by name either way, not moved. After updating, re-copy the
+`UnrealPlugin/BBUnrealExportTools` folder into the engine's `Plugins/Editor`
+(see `init_unreal.py`) so the dialog shows the new checkbox.
+
 For each JSON entry the script imports the source FBX once per unique mesh
 (skips re-importing if the asset already exists at that path), then spawns a
 `StaticMeshActor` per object referencing that asset — objects that shared

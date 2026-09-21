@@ -31,7 +31,7 @@ DEFAULT_BROWSE_DIR = ""  # left blank on purpose -- shared across every project,
 _last_browse_dir = DEFAULT_BROWSE_DIR
 
 
-def _run_prompt_flow(initial_dir, default_create_level_instance, default_import_materials):
+def _run_prompt_flow(initial_dir, default_create_level_instance, default_import_materials, default_shared_materials):
     # A single shared Tk() root drives both dialogs. Tkinter only supports one
     # live root interpreter per process -- creating a second Tk() after the
     # first is destroyed leaves Tcl/Tk in a broken state (this previously
@@ -43,6 +43,7 @@ def _run_prompt_flow(initial_dir, default_create_level_instance, default_import_
         "mode": "full",
         "create_level_instance": default_create_level_instance,
         "import_materials": default_import_materials,
+        "shared_materials": default_shared_materials,
     }
 
     root = tk.Tk()
@@ -68,6 +69,7 @@ def _run_prompt_flow(initial_dir, default_create_level_instance, default_import_
         mode_var = tk.StringVar(master=dialog, value="full")
         level_instance_var = tk.BooleanVar(master=dialog, value=default_create_level_instance)
         materials_var = tk.BooleanVar(master=dialog, value=default_import_materials)
+        shared_var = tk.BooleanVar(master=dialog, value=default_shared_materials)
 
         tk.Label(dialog, text="Rebuild Scene").pack(pady=14)
 
@@ -94,6 +96,10 @@ def _run_prompt_flow(initial_dir, default_create_level_instance, default_import_
             dialog, text="Import materials (rebuild against MM_Standard_01)", variable=materials_var
         )
         materials_check.pack(padx=16, pady=4, anchor="w")
+        shared_check = tk.Checkbutton(
+            dialog, text="Shared Materials (one Instances/Textures folder for all collections)", variable=shared_var
+        )
+        shared_check.pack(padx=16, pady=4, anchor="w")
 
         # Each mode only uses a subset of these two checkboxes -- grey out
         # (and force to the only sensible value) whichever ones don't apply,
@@ -103,13 +109,16 @@ def _run_prompt_flow(initial_dir, default_create_level_instance, default_import_
             if mode == "full":
                 level_instance_check.config(state=tk.NORMAL)
                 materials_check.config(state=tk.NORMAL)
+                shared_check.config(state=tk.NORMAL)
             elif mode == "materials_only":
                 level_instance_check.config(state=tk.DISABLED)
                 materials_var.set(True)
                 materials_check.config(state=tk.DISABLED)
+                shared_check.config(state=tk.NORMAL)
             elif mode == "transforms_only":
                 level_instance_check.config(state=tk.DISABLED)
                 materials_check.config(state=tk.DISABLED)
+                shared_check.config(state=tk.DISABLED)
 
         mode_var.trace_add("write", _update_checkbox_states)
         _update_checkbox_states()
@@ -121,6 +130,7 @@ def _run_prompt_flow(initial_dir, default_create_level_instance, default_import_
             result["mode"] = mode_var.get()
             result["create_level_instance"] = level_instance_var.get()
             result["import_materials"] = materials_var.get()
+            result["shared_materials"] = shared_var.get()
             result["confirmed"] = True
             dialog.destroy()
 
@@ -148,7 +158,8 @@ class BBUnrealExportRebuildEntry(unreal.ToolMenuEntryScript):
 
         try:
             options = _run_prompt_flow(
-                _last_browse_dir, default_create_level_instance=True, default_import_materials=True
+                _last_browse_dir, default_create_level_instance=True, default_import_materials=True,
+                default_shared_materials=True,
             )
         except Exception as exc:
             unreal.log_error(f"BB Unreal Export: prompt failed ({exc})")
@@ -173,6 +184,7 @@ class BBUnrealExportRebuildEntry(unreal.ToolMenuEntryScript):
                     "BB_MODE": options["mode"],
                     "BB_CREATE_LEVEL_INSTANCE": options["create_level_instance"],
                     "BB_IMPORT_MATERIALS": options["import_materials"],
+                    "BB_SHARED_MATERIALS": options["shared_materials"],
                 },
             )
 

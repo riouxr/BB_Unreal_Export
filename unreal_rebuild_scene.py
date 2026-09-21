@@ -30,6 +30,7 @@ import tempfile
 DEFAULT_JSON_PATH = r"E:\Epic\UDS_barcelona\bb_unreal_export_transforms.json"
 DEFAULT_CONTENT_PATH = "/Game/BB_Unreal_Export"  # used only if no folder is highlighted in the Content Browser
 DEFAULT_CREATE_LEVEL_INSTANCE = True         # group the spawned actors into one Level Instance
+DEFAULT_SHARED_MATERIALS = True              # one shared Instances/Textures folder next to MM_Standard_01 for every collection, instead of per-collection _Material/_Textures folders
 DEFAULT_IMPORT_MATERIALS = True              # rebuild materials against MM_Standard_01 from the JSON's recorded Blender material graph info
 DEFAULT_MODE = "full"                        # "full" | "materials_only" | "transforms_only"
 MASTER_MATERIAL_NAME = "MM_Standard_01"
@@ -57,7 +58,7 @@ def _normalize_content_path(path):
 # MI_ instance and then running the script again without reselecting the
 # parent folder first.
 _GENERATED_SUBFOLDER_SUFFIXES = ("_Mesh", "_Material", "_Textures")
-_GENERATED_SUBFOLDER_EXACT_NAMES = ("Materials", "Levels")
+_GENERATED_SUBFOLDER_EXACT_NAMES = ("Materials", "Levels", "Instances")
 
 
 def _avoid_generated_subfolder(path):
@@ -105,7 +106,7 @@ def _resolve_content_path():
     return DEFAULT_CONTENT_PATH
 
 
-# BB_JSON_PATH / BB_CREATE_LEVEL_INSTANCE / BB_IMPORT_MATERIALS / BB_CONTENT_PATH
+# BB_JSON_PATH / BB_CREATE_LEVEL_INSTANCE / BB_IMPORT_MATERIALS / BB_SHARED_MATERIALS / BB_CONTENT_PATH
 # are injected into globals() by the Tools menu entry (file picker + option
 # checkboxes); fall back to the defaults above for manual runs pasted
 # straight into the console.
@@ -113,6 +114,7 @@ JSON_PATH = globals().get("BB_JSON_PATH") or DEFAULT_JSON_PATH
 FBX_DIR = os.path.dirname(JSON_PATH)         # exported .fbx files sit next to the JSON
 CREATE_LEVEL_INSTANCE = globals().get("BB_CREATE_LEVEL_INSTANCE", DEFAULT_CREATE_LEVEL_INSTANCE)
 IMPORT_MATERIALS = globals().get("BB_IMPORT_MATERIALS", DEFAULT_IMPORT_MATERIALS)
+SHARED_MATERIALS = globals().get("BB_SHARED_MATERIALS", DEFAULT_SHARED_MATERIALS)
 # "full" (import/spawn/materials/level instance, the normal rebuild) |
 # "materials_only" (reapply materials to already-imported meshes, nothing
 # else -- no FBX import, no actors touched) | "transforms_only" (move
@@ -536,6 +538,31 @@ def _find_master_material_anywhere():
     return None
 
 
+_shared_root = None
+
+
+def _shared_material_root():
+    # With Shared Materials on, every collection's material instances and
+    # textures go into one place: the folder that already holds MM_Standard_01
+    # (found by scanning the whole project, so a rerun from a different
+    # highlighted folder still lands in the same one), or MATERIAL_DEST_PATH
+    # when there is no master yet and this run is about to build it.
+    global _shared_root
+    if _shared_root is None:
+        master = _find_master_material_anywhere()
+        _shared_root = master.get_path_name().rsplit("/", 1)[0] if master is not None else MATERIAL_DEST_PATH
+        unreal.log(f"BB Unreal Export: Shared Materials -- using '{_shared_root}/Instances' and '{_shared_root}/Textures'")
+    return _shared_root
+
+
+def _instance_dest_path():
+    return f"{_shared_material_root()}/Instances" if SHARED_MATERIALS else INSTANCE_DEST_PATH
+
+
+def _texture_dest_path():
+    return f"{_shared_material_root()}/Textures" if SHARED_MATERIALS else TEXTURE_DEST_PATH
+
+
 def _ensure_master_material():
     master_path = f"{MATERIAL_DEST_PATH}/{MASTER_MATERIAL_NAME}"
     existing = None
@@ -770,7 +797,8 @@ def _ensure_material_instance(master, mat_name, base_color_tex, base_color_tint,
     # the next run, because the old code returned the untouched existing
     # asset before ever looking at the new parameter values.
     name = _instance_asset_name(mat_name)
-    asset_path = f"{INSTANCE_DEST_PATH}/{name}"
+    instance_dest = _instance_dest_path()
+    asset_path = f"{instance_dest}/{name}"
     instance = unreal.EditorAssetLibrary.load_asset(asset_path) if unreal.EditorAssetLibrary.does_asset_exist(asset_path) else None
     if instance is None:
         instance = _find_asset_by_name_anywhere(unreal.TopLevelAssetPath("/Script/Engine", "MaterialInstanceConstant"), name)
@@ -781,7 +809,7 @@ def _ensure_material_instance(master, mat_name, base_color_tex, base_color_tint,
 
     if created:
         factory = unreal.MaterialInstanceConstantFactoryNew()
-        instance = unreal.AssetToolsHelpers.get_asset_tools().create_asset(name, INSTANCE_DEST_PATH, unreal.MaterialInstanceConstant, factory)
+        instance = unreal.AssetToolsHelpers.get_asset_tools().create_asset(name, instance_dest, unreal.MaterialInstanceConstant, factory)
         if instance is None:
             unreal.log_error(f"BB Unreal Export: could not create material instance '{name}'")
             return None
@@ -837,7 +865,7 @@ def _load_texture_for_slot(filename):
     if not os.path.isfile(file_path):
         unreal.log_warning(f"BB Unreal Export: texture '{filename}' not found in '{TEXTURES_DIR}' (run Collect Textures in Blender?)")
         return None
-    return _import_loose_texture(file_path, TEXTURE_DEST_PATH, os.path.splitext(filename)[0])
+    return _import_loose_texture(file_path, _texture_dest_path(), os.path.splitext(filename)[0])
 
 
 def _apply_materials(static_mesh, material_names, materials_data):
