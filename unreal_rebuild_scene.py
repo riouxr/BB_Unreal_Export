@@ -58,7 +58,7 @@ def _normalize_content_path(path):
 # MI_ instance and then running the script again without reselecting the
 # parent folder first.
 _GENERATED_SUBFOLDER_SUFFIXES = ("_Mesh", "_Material", "_Textures")
-_GENERATED_SUBFOLDER_EXACT_NAMES = ("Materials", "Levels", "Instances")
+_GENERATED_SUBFOLDER_EXACT_NAMES = ("Materials", "Levels", "Instances", "Textures")
 
 
 def _avoid_generated_subfolder(path):
